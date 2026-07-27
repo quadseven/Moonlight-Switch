@@ -27,6 +27,13 @@ class MoonlightSession {
 
     void draw(NVGcontext* vg, int width, int height);
 
+    // Stops the session touching the GPU while the app is not on screen, and
+    // makes it drop any resource that may not have survived being off screen
+    // once it comes back. See StreamingView::onWindowFocusChanged().
+    void set_suspended(bool suspended);
+
+    bool is_suspended() const { return m_suspended; }
+
     bool is_active() const { return m_is_active; }
     bool is_terminated() const { return m_is_terminated; }
 
@@ -84,6 +91,8 @@ class MoonlightSession {
     bool m_is_active = false;
     bool m_is_terminated = false;
     bool m_stop_requested = false;
+    bool m_suspended = false;
+    bool m_invalidate_renderer_pending = false;
     bool m_connection_status_is_poor = false;
     bool m_use_hdr = false;
 

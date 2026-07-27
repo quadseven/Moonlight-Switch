@@ -109,6 +109,10 @@ StreamingView::StreamingView(const Host& host, const AppInfo& app) : host(host),
             }, result.value().isSunshine());
         });
 
+    windowFocusSubscription =
+        Application::getWindowFocusChangedEvent()->subscribe(
+            [this](bool focused) { this->onWindowFocusChanged(focused); });
+
     MoonlightInputManager::instance().reloadButtonMappingLayout();
 
     static bool lMouseKeyGate = false;
@@ -284,8 +288,35 @@ void StreamingView::onFocusLost() {
         cancelDelay(bottombarDelayTask);
 }
 
+void StreamingView::onWindowFocusChanged(bool focused) {
+    if (windowFocused == focused)
+        return;
+
+    windowFocused = focused;
+    Logger::info("StreamingView: window focus {}",
+                 focused ? "gained" : "lost");
+
+    if (!focused) {
+        // On Switch this is the console going to sleep or the HOME menu
+        // taking over. Nothing we render is visible from here on, so stop
+        // the session before the graphics service goes away underneath it.
+        MoonlightInputManager::instance().dropInput();
+    }
+
+    session->set_suspended(!focused);
+}
+
 void StreamingView::draw(NVGcontext* vg, float x, float y, float width,
                          float height, Style style, FrameContext* ctx) {
+    if (!windowFocused) {
+        // Do not run the stream, the input handling or the overlays while the
+        // app is off screen. This has to come before the is_terminated()
+        // check: a session dropped by the console turning its wifi off for
+        // sleep must not tear activities down from under a compositor that is
+        // not running. The check below picks it up on the first frame back.
+        return;
+    }
+
     if (session->is_terminated()) {
         terminate(false);
         return;
@@ -590,6 +621,8 @@ StreamingView::~StreamingView() {
 #endif
     
     Application::getPlatform()->disableScreenDimming(false);
+    Application::getWindowFocusChangedEvent()->unsubscribe(
+        windowFocusSubscription);
     Application::getPlatform()
         ->getInputManager()
         ->getKeyboardKeyStateChanged()

@@ -398,8 +398,37 @@ void MoonlightSession::restart() {
     }, m_active_session->m_is_sunshine);
 }
 
+void MoonlightSession::set_suspended(bool suspended) {
+    if (m_suspended == suspended) {
+        return;
+    }
+
+    m_suspended = suspended;
+    brls::Logger::info("MoonlightSession: rendering {}",
+                       suspended ? "suspended" : "resumed");
+
+    if (!suspended) {
+        // The renderer is owned by the decoder callbacks and torn down on
+        // their thread, so let draw() do this from the render thread inside
+        // the guard it already holds rather than reaching for it here.
+        m_invalidate_renderer_pending = true;
+    }
+}
+
 void MoonlightSession::draw(NVGcontext* vg, int width, int height) {
+    // While the app is off screen the compositor is not showing our frames and
+    // the graphics service may be shutting down under us, so there is nothing
+    // to gain by drawing and a suspended GPU to fault by trying.
+    if (m_suspended) {
+        return;
+    }
+
     if (m_video_decoder && m_video_renderer) {
+        if (m_invalidate_renderer_pending) {
+            m_invalidate_renderer_pending = false;
+            m_video_renderer->invalidateHardwareResources();
+        }
+
         AVFrameHolder::instance().get(
             [this, vg, width, height](AVFrame* frame) {
                 m_video_renderer->draw(vg, width, height, frame, m_video_format);
