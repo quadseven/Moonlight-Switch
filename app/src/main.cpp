@@ -20,6 +20,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 }
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 
 #include <borealis.hpp>
@@ -116,7 +117,10 @@ int main(int argc, char* argv[]) {
 
     // Set log level
     // We recommend to use INFO for real apps
-    brls::Logger::setLogLevel(brls::LogLevel::LOG_DEBUG);
+    // DIAGNOSTIC BUILD: INFO, not DEBUG. Every line is fflush()ed to the SD
+    // card, and DEBUG volume during a 60fps stream would perturb the timing
+    // we are trying to observe. The focus/suspend/resume lines are all INFO.
+    brls::Logger::setLogLevel(brls::LogLevel::LOG_INFO);
 
     // Init the app and i18n
     if (!brls::Application::init()) {
@@ -139,6 +143,28 @@ int main(int argc, char* argv[]) {
     Settings::instance().set_working_dir(home);
     Settings::instance().set_launch_path(argc > 0 ? argv[0] : "");
     brls::Logger::info("Working dir, {}", home);
+
+#ifdef __SWITCH__
+    // DIAGNOSTIC BUILD ONLY, not intended for upstream.
+    //
+    // Settings computes m_log_path as <home>/log.log but nothing ever uses
+    // it, so every borealis log line goes to stdout and is discarded on a
+    // console with no nxlink attached. Point the logger at that file so a
+    // sleep/resume hang leaves a trail behind. borealis fflush()es after
+    // every line, so whatever was written last survives the hard power off
+    // that recovering from the hang requires.
+    //
+    // This is set up before the shipper starts so that everything from here
+    // on, including the shipper's own startup line, lands in the file too.
+    // The two are independent: the file always works, the shipper only if a
+    // key is present, and losing the network costs you the shipper only.
+    if (std::FILE* logFile =
+            std::fopen(Settings::instance().log_path().c_str(), "w")) {
+        brls::Logger::setLogOutput(logFile);
+        brls::Logger::info("DIAGNOSTIC BUILD: file logging to {}",
+                           Settings::instance().log_path());
+    }
+#endif
 
     // Opt in only: does nothing unless <working dir>/datadog.key exists.
     if (DatadogLogShipper::instance().start(home)) {

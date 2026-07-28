@@ -404,8 +404,14 @@ void MoonlightSession::set_suspended(bool suspended) {
     }
 
     m_suspended = suspended;
-    brls::Logger::info("MoonlightSession: rendering {}",
-                       suspended ? "suspended" : "resumed");
+    // DIAGNOSTIC BUILD: report the session state across the transition. After
+    // a real sleep the wifi was off, so this is where a dead connection that
+    // nobody has declared terminated shows up as active=1 terminated=0 with
+    // no frames arriving.
+    brls::Logger::info("MoonlightSession: rendering {} (active={} terminated={} "
+                       "stop_requested={})",
+                       suspended ? "suspended" : "resumed", m_is_active,
+                       m_is_terminated, m_stop_requested);
 
     if (!suspended) {
         // The renderer is owned by the decoder callbacks and torn down on
