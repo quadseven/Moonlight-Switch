@@ -33,7 +33,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "main_tabs_view.hpp"
 #include "settings_tab.hpp"
 #include "views/boolean_slider_cell.hpp"
-#include "DatadogLogShipper.hpp"
+#include "OtlpLogExporter.hpp"
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
@@ -166,9 +166,10 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    // Opt in only: does nothing unless <working dir>/datadog.key exists.
-    if (DatadogLogShipper::instance().start(home)) {
-        brls::Logger::info("Datadog log shipping enabled");
+    // Opt in only: does nothing unless <working dir>/otel-endpoint exists.
+    if (OtlpLogExporter::instance().start(home)) {
+        brls::Logger::info("OTLP log export enabled, endpoint {}",
+                           OtlpLogExporter::instance().endpoint());
     }
 
     // Have the application register an action on every activity that will quit
@@ -225,20 +226,20 @@ int main(int argc, char* argv[]) {
     // thread, is how a silent transport failure becomes visible at all. The
     // first version had no equivalent, which is why every POST failing TLS
     // verification looked exactly like everything working.
-    if (DatadogLogShipper::instance().enabled()) {
-        const auto stats = DatadogLogShipper::instance().stats();
-        brls::Logger::info("Datadog: accepted={} sent={} droppedFailed={} "
+    if (OtlpLogExporter::instance().enabled()) {
+        const auto stats = OtlpLogExporter::instance().stats();
+        brls::Logger::info("OTLP: accepted={} sent={} droppedFailed={} "
                            "droppedOverflow={} postFailures={}",
                            stats.accepted, stats.sent, stats.droppedFailed,
                            stats.droppedOverflow, stats.postFailures);
-        const std::string lastError = DatadogLogShipper::instance().lastError();
+        const std::string lastError = OtlpLogExporter::instance().lastError();
         if (!lastError.empty()) {
-            brls::Logger::error("Datadog: last transport error: {}", lastError);
+            brls::Logger::error("OTLP: last transport error: {}", lastError);
         }
     }
 
     // Flush and join before exit so the last lines actually ship.
-    DatadogLogShipper::instance().stop();
+    OtlpLogExporter::instance().stop();
 
     // Exit
 #if defined(PLATFORM_TVOS)
