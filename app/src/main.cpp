@@ -32,6 +32,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "main_tabs_view.hpp"
 #include "settings_tab.hpp"
 #include "views/boolean_slider_cell.hpp"
+#include "DatadogLogShipper.hpp"
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
@@ -139,6 +140,11 @@ int main(int argc, char* argv[]) {
     Settings::instance().set_launch_path(argc > 0 ? argv[0] : "");
     brls::Logger::info("Working dir, {}", home);
 
+    // Opt in only: does nothing unless <working dir>/datadog.key exists.
+    if (DatadogLogShipper::instance().start(home)) {
+        brls::Logger::info("Datadog log shipping enabled");
+    }
+
     // Have the application register an action on every activity that will quit
     // when you press BUTTON_START
     brls::Application::setGlobalQuit(false);
@@ -185,6 +191,9 @@ int main(int argc, char* argv[]) {
         }
 #endif
     }
+
+    // Flush and join before exit so the last lines actually ship.
+    DatadogLogShipper::instance().stop();
 
     // Exit
 #if defined(PLATFORM_TVOS)
