@@ -49,6 +49,12 @@ class DatadogLogShipper {
         size_t postFailures;
     };
 
+    /**
+     * Last transport failure, or empty. Recorded rather than logged: nothing
+     * on the worker path may call brls::Logger. Read it from the main thread.
+     */
+    [[nodiscard]] std::string lastError() const;
+
     [[nodiscard]] Stats stats() const;
 
   private:
@@ -70,6 +76,7 @@ class DatadogLogShipper {
     std::string m_apiKey;
     std::string m_endpoint;
     std::string m_tags;
+    std::string m_caBundlePath;
 
     mutable std::mutex m_mutex;
     std::condition_variable m_wake;
@@ -84,4 +91,5 @@ class DatadogLogShipper {
 
     mutable std::mutex m_statsMutex;
     Stats m_stats {};
+    std::string m_lastError;
 };

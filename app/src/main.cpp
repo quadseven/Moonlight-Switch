@@ -192,6 +192,25 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
+    // Report what the shipper actually did. It cannot log for itself: it runs
+    // on a worker thread and borealis fires the log event under logMtx, so a
+    // shipper that logged its own POST failure would generate the line that
+    // causes the next failure. Reading its counters here, from the main
+    // thread, is how a silent transport failure becomes visible at all. The
+    // first version had no equivalent, which is why every POST failing TLS
+    // verification looked exactly like everything working.
+    if (DatadogLogShipper::instance().enabled()) {
+        const auto stats = DatadogLogShipper::instance().stats();
+        brls::Logger::info("Datadog: accepted={} sent={} droppedFailed={} "
+                           "droppedOverflow={} postFailures={}",
+                           stats.accepted, stats.sent, stats.droppedFailed,
+                           stats.droppedOverflow, stats.postFailures);
+        const std::string lastError = DatadogLogShipper::instance().lastError();
+        if (!lastError.empty()) {
+            brls::Logger::error("Datadog: last transport error: {}", lastError);
+        }
+    }
+
     // Flush and join before exit so the last lines actually ship.
     DatadogLogShipper::instance().stop();
 
