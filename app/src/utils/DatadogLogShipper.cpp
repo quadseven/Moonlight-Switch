@@ -132,6 +132,23 @@ bool DatadogLogShipper::start(const std::string& workingDir) {
         return false;
     }
 
+    // A CA bundle is mandatory, not optional.
+    //
+    // libgamestream sets CURLOPT_SSL_VERIFYPEER 0 because GameStream hosts use
+    // self signed certs, so the app ships no CA chain at all. That is fine for
+    // a host on your own LAN. It is not fine here: this request carries an API
+    // key to an endpoint on the internet, and without verification anyone on
+    // the path could present their own certificate and collect it. So require
+    // a bundle and stay inert without one, rather than quietly downgrading.
+    m_caBundlePath = workingDir + "/cacert.pem";
+    {
+        std::ifstream caBundle(m_caBundlePath);
+        if (!caBundle.is_open()) {
+            m_caBundlePath.clear();
+            return false;
+        }
+    }
+
     m_apiKey = key;
     m_endpoint = "https://http-intake.logs." + site + "/api/v2/logs";
     m_tags = tags;
@@ -319,6 +336,7 @@ bool DatadogLogShipper::post(const std::string& body) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kPostTimeoutSeconds);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discardResponse);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CAINFO, m_caBundlePath.c_str());
 
     const CURLcode result = curl_easy_perform(curl);
     long status = 0;
@@ -329,10 +347,26 @@ bool DatadogLogShipper::post(const std::string& body) {
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    return result == CURLE_OK && status >= 200 && status < 300;
+    const bool ok = result == CURLE_OK && status >= 200 && status < 300;
+    if (!ok) {
+        // Recorded, never logged from here. The main thread reports it.
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        if (result != CURLE_OK) {
+            m_lastError = std::string("curl: ") + curl_easy_strerror(result);
+        } else {
+            m_lastError = "intake returned HTTP " + std::to_string(status);
+        }
+    }
+
+    return ok;
 }
 
 DatadogLogShipper::Stats DatadogLogShipper::stats() const {
     std::lock_guard<std::mutex> lock(m_statsMutex);
     return m_stats;
+}
+
+std::string DatadogLogShipper::lastError() const {
+    std::lock_guard<std::mutex> lock(m_statsMutex);
+    return m_lastError;
 }
