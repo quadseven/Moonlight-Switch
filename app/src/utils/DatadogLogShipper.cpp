@@ -17,22 +17,29 @@ constexpr size_t kMaxBufferedLines = 4000;
 constexpr auto kFlushInterval = std::chrono::seconds(10);
 constexpr long kPostTimeoutSeconds = 10;
 
-/**
- * Guards against the shipper feeding itself.
+/*
+ * There is deliberately no thread_local guard here.
  *
- * borealis fires the log event from inside Logger::log() while logMtx is held,
- * so anything on this path that logs would deadlock on a non recursive mutex.
- * The worker thread is separate and would not deadlock, but a failing POST
- * that logged its own failure would generate the line that causes the next
- * failure. Neither path logs, and this flag makes that structural rather than
- * a rule someone has to remember.
+ * An earlier version kept a `thread_local bool` to mark the worker thread, so
+ * that if the shipper ever logged it would not buffer its own output. On this
+ * platform that crashed the process the instant the worker started: the
+ * generated code reads the thread pointer and offsets into it,
+ *
+ *     mrs  x0, TPIDR_EL0
+ *     add  x0, x0, #0x10
+ *     strb w1, [x0]        <- data abort, TPIDR_EL0 was 0
+ *
+ * and TPIDR_EL0 is zero on a thread spawned this way, so the very first
+ * statement in worker() wrote to null + 0x10. Do not reintroduce thread_local
+ * on this path.
+ *
+ * The invariant it was guarding still holds, and holds by construction: no
+ * function reachable from onLogLine() or worker() calls brls::Logger. It has
+ * to stay that way. borealis fires the log event from inside Logger::log()
+ * while logMtx is held, so logging from the callback would deadlock on a non
+ * recursive mutex, and a POST failure that logged its own failure would
+ * generate the line that causes the next failure. Counters only.
  */
-thread_local bool t_insideShipper = false;
-
-struct ShipperScope {
-    ShipperScope() { t_insideShipper = true; }
-    ~ShipperScope() { t_insideShipper = false; }
-};
 
 std::string trim(const std::string& value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -103,6 +110,28 @@ bool DatadogLogShipper::start(const std::string& workingDir) {
         tags = "app:moonlight-switch,platform:switch";
     }
 
+    // Initialise curl here, on the main thread, before the worker exists.
+    //
+    // curl_easy_init() will lazily call curl_global_init() if nothing has yet,
+    // and curl_global_init() is documented as not thread safe. http_init() in
+    // libgamestream only runs when connecting to a host, so without this the
+    // worker's first POST could race it, or win and leave curl on a TLS
+    // backend that http_init()'s curl_global_sslset() is then too late to
+    // change. Picking the same backend it would have picked keeps the end
+    // state identical no matter which of us gets there first.
+#if LIBCURL_VERSION_NUM >= 0x075600
+#ifdef USE_OPENSSL_CRYPTO
+    curl_global_sslset(CURLSSLBACKEND_OPENSSL, NULL, NULL);
+#elif USE_MBEDTLS_CRYPTO
+    curl_global_sslset(CURLSSLBACKEND_MBEDTLS, NULL, NULL);
+#endif
+#endif
+    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+        // Without curl there is nothing to ship to. Stay inert rather than
+        // starting a worker that can only fail.
+        return false;
+    }
+
     m_apiKey = key;
     m_endpoint = "https://http-intake.logs." + site + "/api/v2/logs";
     m_tags = tags;
@@ -142,14 +171,14 @@ void DatadogLogShipper::stop() {
     m_enabled = false;
     // Do not keep the key in memory once shipping is off.
     m_apiKey.clear();
+
+    // Matches the curl_global_init() in start(). curl refcounts these, so
+    // libgamestream's own init is unaffected by this one going away.
+    curl_global_cleanup();
 }
 
 void DatadogLogShipper::onLogLine(brls::LogLevel level,
                                   const std::string& line) {
-    if (t_insideShipper) {
-        return;
-    }
-
     bool overflowed = false;
 
     {
@@ -179,8 +208,6 @@ void DatadogLogShipper::onLogLine(brls::LogLevel level,
 }
 
 void DatadogLogShipper::worker() {
-    ShipperScope scope;
-
     for (;;) {
         std::deque<std::string> batch;
         std::deque<std::string> levels;
