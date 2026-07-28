@@ -1070,8 +1070,11 @@ void DKVideoRenderer::invalidateHardwareResources() {
     // the one the next frame actually needs, exactly as it does when the
     // frame size changes.
     queue.waitIdle();
+    const size_t droppedMappings = frameMappings.size();
     frameMappings.clear();
     currentMappingIndex = -1;
+    brls::Logger::info("DKVideoRenderer: dropped {} hardware frame mapping(s)",
+                       droppedMappings);
 }
 
 void DKVideoRenderer::releaseImageSlots() {
