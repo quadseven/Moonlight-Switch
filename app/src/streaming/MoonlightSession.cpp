@@ -410,8 +410,8 @@ void MoonlightSession::set_suspended(bool suspended) {
     // no frames arriving.
     brls::Logger::info("MoonlightSession: rendering {} (active={} terminated={} "
                        "stop_requested={})",
-                       suspended ? "suspended" : "resumed", m_is_active,
-                       m_is_terminated, m_stop_requested);
+                       suspended ? "suspended" : "resumed", m_is_active.load(),
+                       m_is_terminated.load(), m_stop_requested.load());
 
     if (!suspended) {
         // The renderer is owned by the decoder callbacks and torn down on
