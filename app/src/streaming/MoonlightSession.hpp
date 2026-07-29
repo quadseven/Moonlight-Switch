@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GameStreamClient.hpp"
+#include <atomic>
 #include "MoonlightSessionDecoderAndRenderProvider.hpp"
 #include <nanovg.h>
 
@@ -88,9 +89,14 @@ class MoonlightSession {
     IVideoRenderer* m_video_renderer = nullptr;
     IAudioRenderer* m_audio_renderer = nullptr;
 
-    bool m_is_active = false;
-    bool m_is_terminated = false;
-    bool m_stop_requested = false;
+    // Atomic because they cross threads: the connection-status callbacks
+    // arrive on moonlight-common-c's detached termination thread while the
+    // UI thread polls is_active()/is_terminated() every frame. As plain
+    // bools those concurrent accesses are a data race, which is undefined
+    // behaviour, not merely a stale read.
+    std::atomic<bool> m_is_active{false};
+    std::atomic<bool> m_is_terminated{false};
+    std::atomic<bool> m_stop_requested{false};
     bool m_suspended = false;
     bool m_invalidate_renderer_pending = false;
     bool m_connection_status_is_poor = false;

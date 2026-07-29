@@ -219,14 +219,18 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // Report what the shipper actually did. It cannot log for itself: it runs
-    // on a worker thread and borealis fires the log event under logMtx, so a
-    // shipper that logged its own POST failure would generate the line that
-    // causes the next failure. Reading its counters here, from the main
-    // thread, is how a silent transport failure becomes visible at all. The
-    // first version had no equivalent, which is why every POST failing TLS
-    // verification looked exactly like everything working.
-    if (OtlpLogExporter::instance().enabled()) {
+    // Stop FIRST, then report. stop() is the final flush and join, and a
+    // summary read before it does not count anything that flush sends. That
+    // ordering bug produced an exit line of sent=0 on a run where every
+    // record demonstrably arrived at the backend, which reads as a transport
+    // failure and sends whoever is debugging it in exactly the wrong
+    // direction. The price of the correct order is that the summary itself
+    // can no longer ship; it lands in the on-card log only, which is fine,
+    // because the numbers it carries are about the run that just ended.
+    const bool otlpWasEnabled = OtlpLogExporter::instance().enabled();
+    OtlpLogExporter::instance().stop();
+
+    if (otlpWasEnabled) {
         const auto stats = OtlpLogExporter::instance().stats();
         brls::Logger::info("OTLP: accepted={} sent={} droppedFailed={} "
                            "droppedOverflow={} postFailures={}",
@@ -237,9 +241,6 @@ int main(int argc, char* argv[]) {
             brls::Logger::error("OTLP: last transport error: {}", lastError);
         }
     }
-
-    // Flush and join before exit so the last lines actually ship.
-    OtlpLogExporter::instance().stop();
 
     // Exit
 #if defined(PLATFORM_TVOS)
