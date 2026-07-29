@@ -1,0 +1,16 @@
+name: Hardening build
+
+# all-builds only runs on master, so branch work has no Switch build without
+# this thin caller. Reuses the same docker build the release path uses.
+
+on:
+  push:
+    branches: [ fix/306-hardening ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  switch:
+    uses: ./.github/workflows/docker-image.yml
