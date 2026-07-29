@@ -12,15 +12,15 @@ name: NoSuspend experiment
 # if the default handling mode avoids the fault on its own, the renderer patch
 # would be unnecessary.
 #
-# Two builds, both with the call deleted:
+# Three builds:
 #
-#   baseline  master, without the PR. If this survives sleep and resume, then
+#   baseline  master with the call deleted. If this survives sleep and resume,
 #             removing NoSuspend is sufficient on its own and PR #318 is the
 #             wrong fix.
-#   with-fix  the PR branch. Checks the two changes do not interact badly.
-#
-# The unmodified master build is not included because its behaviour is already
-# known: it is the crash reported in issue #306.
+#   with-fix  the PR branch, call deleted. Interaction check.
+#   control   master untouched. Needed because the only other build that has
+#             NoSuspend also carries the PR318 fix, so without this any
+#             behavioural difference could be attributed to either change.
 #
 # The patch is applied with sed rather than by committing to a borealis fork,
 # because this exists to answer a question rather than to ship.
@@ -46,8 +46,17 @@ jobs:
         include:
           - variant: baseline-nosuspend-removed
             ref: master
+            patch: "yes"
           - variant: pr318-nosuspend-removed
             ref: fix/306-sleep-resume-crash
+            patch: "yes"
+          # The control. Same commit as the baseline, NoSuspend left in place.
+          # Without it, any difference in behaviour could be attributed to the
+          # PR318 fix rather than to the focus handling mode, because the only
+          # other build that has NoSuspend also has the fix.
+          - variant: control-unmodified-master
+            ref: master
+            patch: "no"
 
     steps:
       - name: Check out ${{ matrix.ref }}
@@ -58,6 +67,7 @@ jobs:
           fetch-depth: 0
 
       - name: Delete the NoSuspend call from borealis
+        if: matrix.patch == 'yes'
         env:
           PLATFORM_CPP: extern/borealis/library/lib/platforms/switch/switch_platform.cpp
         # Matched on the call itself rather than a line number, so this fails
@@ -88,13 +98,20 @@ jobs:
       - name: Run build
         run: make -C build/switch Moonlight.nro -j8
 
-      - name: Confirm the call really is absent from the binary
-        # A build that silently kept the call would produce a test result that
-        # means nothing, which is worse than a failed build.
+      - name: Confirm the source matches what this variant claims
+        # A build that silently kept the call, or a control that silently lost
+        # it, would produce a test result that means nothing.
+        env:
+          PATCH: ${{ matrix.patch }}
         run: |
-          if grep -rq "appletSetFocusHandlingMode" \
-              extern/borealis/library/lib/platforms/switch/switch_platform.cpp; then
-            echo "source still contains the call"; exit 1
+          P=extern/borealis/library/lib/platforms/switch/switch_platform.cpp
+          if grep -q "appletSetFocusHandlingMode" "$P"; then present=yes; else present=no; fi
+          echo "NoSuspend present in source: $present (patch=$PATCH)"
+          if [ "$PATCH" = "yes" ] && [ "$present" = "yes" ]; then
+            echo "expected it removed"; exit 1
+          fi
+          if [ "$PATCH" = "no" ] && [ "$present" = "no" ]; then
+            echo "control lost the call"; exit 1
           fi
           ls -la build/switch/Moonlight.nro build/switch/Moonlight.elf
 
