@@ -1,0 +1,116 @@
+name: NoSuspend experiment
+
+# Answers a review question on PR #318: what happens if you remove
+# appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend)?
+#
+# That call is not in this repository. It lives in the borealis submodule, at
+# library/lib/platforms/switch/switch_platform.cpp, and it is set
+# unconditionally for every borealis application. PR #318 does not touch it.
+#
+# It is also the reason the process is still alive across a sleep cycle to
+# observe its nvmap handles being invalidated, so the question is a fair one:
+# if the default handling mode avoids the fault on its own, the renderer patch
+# would be unnecessary.
+#
+# Two builds, both with the call deleted:
+#
+#   baseline  master, without the PR. If this survives sleep and resume, then
+#             removing NoSuspend is sufficient on its own and PR #318 is the
+#             wrong fix.
+#   with-fix  the PR branch. Checks the two changes do not interact badly.
+#
+# The unmodified master build is not included because its behaviour is already
+# known: it is the crash reported in issue #306.
+#
+# The patch is applied with sed rather than by committing to a borealis fork,
+# because this exists to answer a question rather than to ship.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/nosuspend-experiment.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: docker://devkitpro/devkita64:latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline-nosuspend-removed
+            ref: master
+          - variant: pr318-nosuspend-removed
+            ref: fix/306-sleep-resume-crash
+
+    steps:
+      - name: Check out ${{ matrix.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Delete the NoSuspend call from borealis
+        env:
+          PLATFORM_CPP: extern/borealis/library/lib/platforms/switch/switch_platform.cpp
+        # Matched on the call itself rather than a line number, so this fails
+        # loudly if borealis moves it instead of silently patching nothing.
+        run: |
+          grep -q "appletSetFocusHandlingMode" "$PLATFORM_CPP" \
+            || { echo "call not found in $PLATFORM_CPP"; exit 1; }
+          sed -i '/appletSetFocusHandlingMode/d' "$PLATFORM_CPP"
+          if grep -q "appletSetFocusHandlingMode" "$PLATFORM_CPP"; then
+            echo "call still present after patching"; exit 1
+          fi
+          echo "removed. surrounding lines now read:"
+          sed -n '105,115p' "$PLATFORM_CPP"
+
+      - name: Remove useless fonts
+        run: rm -rf ./resources/font
+
+      - name: Remove enet
+        run: dkp-pacman --noconfirm -R switch-enet
+
+      - name: Run cmake
+        continue-on-error: true
+        run: cmake -B build/switch -DCMAKE_BUILD_TYPE=Release -DPLATFORM_SWITCH=ON -DUSE_DEKO3D=ON
+
+      - name: Dirty second cmake run
+        run: cmake -B build/switch -DCMAKE_BUILD_TYPE=Release -DPLATFORM_SWITCH=ON -DUSE_DEKO3D=ON
+
+      - name: Run build
+        run: make -C build/switch Moonlight.nro -j8
+
+      - name: Confirm the call really is absent from the binary
+        # A build that silently kept the call would produce a test result that
+        # means nothing, which is worse than a failed build.
+        run: |
+          if grep -rq "appletSetFocusHandlingMode" \
+              extern/borealis/library/lib/platforms/switch/switch_platform.cpp; then
+            echo "source still contains the call"; exit 1
+          fi
+          ls -la build/switch/Moonlight.nro build/switch/Moonlight.elf
+
+      - name: Rename artifacts
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          mv build/switch/Moonlight.nro "build/switch/Moonlight-${VARIANT}.nro"
+          mv build/switch/Moonlight.elf "build/switch/Moonlight-${VARIANT}.elf"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-nro
+          path: build/switch/Moonlight-${{ matrix.variant }}.nro
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-elf
+          path: build/switch/Moonlight-${{ matrix.variant }}.elf
