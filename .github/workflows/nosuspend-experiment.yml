@@ -21,6 +21,8 @@ name: NoSuspend experiment
 #   control   master untouched. Needed because the only other build that has
 #             NoSuspend also carries the PR318 fix, so without this any
 #             behavioural difference could be attributed to either change.
+#   pr318     the PR branch untouched. Paired with control, the only variable
+#             is the fix, which re-validates it under the same conditions.
 #
 # The patch is applied with sed rather than by committing to a borealis fork,
 # because this exists to answer a question rather than to ship.
@@ -56,6 +58,12 @@ jobs:
           # other build that has NoSuspend also has the fix.
           - variant: control-unmodified-master
             ref: master
+            patch: "no"
+          # Re-validates PR318 itself. Same NoSuspend state as the control, so
+          # the only difference between them is the fix. Without this pair the
+          # fix is only supported by an earlier ad hoc run.
+          - variant: pr318-unmodified
+            ref: fix/306-sleep-resume-crash
             patch: "no"
 
     steps:
