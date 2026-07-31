@@ -139,6 +139,16 @@ int main(int argc, char* argv[]) {
 
     brls::Application::createWindow("title"_i18n);
 
+    // Park the log exporter across console suspends. Losing focus on this
+    // platform means sleep or the HOME menu, and the OS tears the network
+    // stack down underneath us; a POST caught inside curl at that moment does
+    // not survive the resume. Subscribed here rather than in the streaming
+    // view because it has to hold whatever the app is doing, not only while a
+    // stream is up.
+    Application::getWindowFocusChangedEvent()->subscribe([](bool focused) {
+        OtlpLogExporter::instance().setSuspended(!focused);
+    });
+
     auto home = Application::getPlatform()->getHomeDirectory("Moonlight-Switch");
     Settings::instance().set_working_dir(home);
     Settings::instance().set_launch_path(argc > 0 ? argv[0] : "");

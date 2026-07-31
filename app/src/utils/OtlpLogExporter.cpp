@@ -237,6 +237,24 @@ bool OtlpLogExporter::start(const std::string& workingDir) {
     return true;
 }
 
+void OtlpLogExporter::setSuspended(bool suspended) {
+    if (!m_enabled) {
+        return;
+    }
+
+    const bool was = m_suspended.exchange(suspended);
+    if (was == suspended) {
+        return;
+    }
+
+    // Waking on resume matters: the worker may be part way through a ten
+    // second wait, and the records buffered during the sleep should not sit
+    // there for the remainder of it.
+    if (!suspended) {
+        m_wake.notify_all();
+    }
+}
+
 void OtlpLogExporter::stop() {
     if (!m_enabled) {
         return;
@@ -312,6 +330,14 @@ void OtlpLogExporter::worker() {
             m_wake.wait_for(lock, kFlushInterval,
                             [this] { return m_stopping.load(); });
 
+            // Park while the console is suspended rather than taking a batch
+            // we would then try to post over a network the OS is dismantling.
+            // Checked here, inside the lock, so a resume that arrives while
+            // we are waiting is seen immediately.
+            if (m_suspended && !m_stopping) {
+                continue;
+            }
+
             const size_t take = std::min(m_records.size(), kMaxBatchRecords);
             for (size_t i = 0; i < take; i++) {
                 batch.push_back(std::move(m_records.front()));
@@ -324,6 +350,18 @@ void OtlpLogExporter::worker() {
         }
 
         if (batch.empty()) {
+            continue;
+        }
+
+        if (m_suspended && !m_stopping) {
+            // Focus was lost after the batch was taken. Put it back rather
+            // than posting into a network that is going away; the records are
+            // still wanted, just not now.
+            std::lock_guard<std::mutex> lock(m_mutex);
+            while (!batch.empty()) {
+                m_records.push_front(std::move(batch.back()));
+                batch.pop_back();
+            }
             continue;
         }
 

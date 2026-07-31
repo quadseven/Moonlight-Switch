@@ -50,6 +50,28 @@ class OtlpLogExporter {
     /** Stops the worker and makes a final attempt to flush what is buffered. */
     void stop();
 
+    /**
+     * Stops and restarts network activity around a console suspend.
+     *
+     * Nothing here may touch a socket while the app is out of focus. On this
+     * platform losing focus means the console is going to sleep or the HOME
+     * menu has taken over, and the OS tears the network stack down underneath
+     * a running process. A POST already inside curl then sits in bsdsocket
+     * across the suspend and resume boundary with a 15 second timeout, and
+     * the process does not survive it.
+     *
+     * Found by testing: identical binary, endpoint file removed so the
+     * exporter never enabled, survived sleep and resume three times out of
+     * three. With the exporter enabled it faulted on the first attempt, and
+     * the invalidation that runs on the first resumed frame never got to run
+     * at all.
+     *
+     * Records keep accumulating while suspended and ship after resume; the
+     * buffer is bounded and drops oldest, which is the right trade for a
+     * sleep that lasts longer than the buffer.
+     */
+    void setSuspended(bool suspended);
+
     [[nodiscard]] bool enabled() const { return m_enabled; }
 
     /** Resolved endpoint, for logging. Contains no credentials. */
@@ -103,6 +125,7 @@ class OtlpLogExporter {
     std::condition_variable m_wake;
     std::deque<Record> m_records;
     std::atomic<bool> m_stopping { false };
+    std::atomic<bool> m_suspended { false };
 
     std::thread m_thread;
     brls::Event<brls::Logger::TimePoint, brls::LogLevel,
