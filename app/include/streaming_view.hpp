@@ -72,6 +72,18 @@ class StreamingView : public brls::Box {
      */
     bool pendingSuspendTerminate = false;
 
+    /**
+     * How many focus subscriptions this class currently holds.
+     *
+     * One streaming view exists at a time, so this is 1 while streaming and 0
+     * otherwise. Anything else is a leak. It is logged on both sides so the
+     * value shows up in whatever is collecting logs, which is the only way a
+     * bug of this shape announces itself: the previous version subscribed in
+     * onFocusGained, gained a callback per focus cycle, and said nothing at
+     * all until the leftovers fired on a destroyed object.
+     */
+    static inline int focusSubscriptionCount = 0;
+
   public:
 
     bool draw_stats = false;

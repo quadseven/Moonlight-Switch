@@ -82,6 +82,24 @@ StreamingView::StreamingView(const Host& host, const AppInfo& app) : host(host),
 
     session = new MoonlightSession(host.preferred_address(), app.app_id);
 
+    // Subscribed here, once, and not in onFocusGained. onFocusGained runs
+    // every time this view regains focus, including when an overlay closes,
+    // so subscribing there added a callback per focus cycle while the
+    // destructor only ever removes one. The leftovers stayed registered on a
+    // global event pointing at freed memory, and fired after the view died.
+    windowFocusSubscription =
+        Application::getWindowFocusChangedEvent()->subscribe(
+            [this](bool focused) { this->onWindowFocusChanged(focused); });
+
+    // A countable invariant. There is one streaming view at a time, so this
+    // is 1 while streaming and 0 otherwise, always. brls::Event keeps its
+    // callback list private and offers no count, and the previous version of
+    // this code leaked a subscription per focus cycle in complete silence.
+    // A number that can be watched is the difference between finding that in
+    // seconds and finding it in a stranger's debugger.
+    Logger::info("StreamingView: focus subscriptions held = {}",
+                 ++focusSubscriptionCount);
+
 #ifdef PLATFORM_TVOS
         updatePreferredDisplayMode(true);
 #endif
@@ -261,12 +279,6 @@ void StreamingView::onFocusGained() {
     setBottomBarStatus("1");
 
     scrollTouchRecognizer->forceReset();
-
-    // End the stream when the console suspends, the way Moonlight on Android
-    // does. See the comment on onWindowFocusChanged in the header.
-    windowFocusSubscription =
-        Application::getWindowFocusChangedEvent()->subscribe(
-            [this](bool focused) { this->onWindowFocusChanged(focused); });
 }
 
 void StreamingView::onFocusLost() {
@@ -303,7 +315,7 @@ void StreamingView::draw(NVGcontext* vg, float x, float y, float width,
         return;
     }
 
-    if (!session || session->is_terminated()) {
+    if (session->is_terminated()) {
         terminate(false);
         return;
     }
@@ -453,6 +465,11 @@ void StreamingView::onWindowFocusChanged(bool focused) {
     // terminate() would dismiss this view and unsubscribe from inside that
     // iteration. Record the intent; draw() acts on it.
     Logger::info("StreamingView: focus lost, will end the stream");
+    // Disable before dropping: dropInput() sends release events, and with
+    // input still enabled every later input path keeps queueing onto a
+    // connection that is going away, which is where the wall of "Input queue
+    // reached maximum size limit" comes from.
+    MoonlightInputManager::instance().setInputEnabled(false);
     MoonlightInputManager::instance().dropInput();
     pendingSuspendTerminate = true;
 }
@@ -632,6 +649,8 @@ StreamingView::~StreamingView() {
         ->unsubscribe(keysSubscription);
     Application::getWindowFocusChangedEvent()->unsubscribe(
         windowFocusSubscription);
+    Logger::info("StreamingView: focus subscriptions held = {}",
+                 --focusSubscriptionCount);
     session->stop(false);
     delete session;
 }
