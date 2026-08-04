@@ -1,0 +1,16 @@
+name: Android parity build
+
+# Builds the branch behind PR #318. all-builds only triggers on master, so
+# branch work has no Switch build without a thin caller like this one.
+
+on:
+  push:
+    branches: [ feat/306-android-parity ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  switch:
+    uses: ./.github/workflows/docker-image.yml
