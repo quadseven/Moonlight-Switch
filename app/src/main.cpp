@@ -20,8 +20,12 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 }
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <optional>
 
 #include <borealis.hpp>
 #include <string>
@@ -34,6 +38,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "settings_tab.hpp"
 #include "views/boolean_slider_cell.hpp"
 #include "OtlpLogExporter.hpp"
+#include "StdoutCapture.hpp"
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
@@ -91,6 +96,45 @@ void preferSwitchCore(int ordinal) {
 
 } // namespace
 #endif
+
+namespace {
+
+/**
+ * Reads <working dir>/otel-log-level, if present.
+ *
+ * Returns nothing when the file is absent, empty or unrecognised, which
+ * leaves whatever level was already set. An unrecognised value is
+ * deliberately not an error and not a silent downgrade: verbosity is a
+ * debugging aid, and a typo in it should not change how the app logs.
+ */
+std::optional<brls::LogLevel> readOtelLogLevel(const std::string& workingDir) {
+    std::ifstream file(workingDir + "/otel-log-level");
+    if (!file.good()) {
+        return std::nullopt;
+    }
+
+    std::string line;
+    std::getline(file, line);
+
+    const auto begin = line.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto end = line.find_last_not_of(" \t\r\n");
+    line = line.substr(begin, end - begin + 1);
+
+    std::transform(line.begin(), line.end(), line.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (line == "error") return brls::LogLevel::LOG_ERROR;
+    if (line == "warning" || line == "warn") return brls::LogLevel::LOG_WARNING;
+    if (line == "info") return brls::LogLevel::LOG_INFO;
+    if (line == "debug") return brls::LogLevel::LOG_DEBUG;
+    if (line == "verbose" || line == "trace") return brls::LogLevel::LOG_VERBOSE;
+    return std::nullopt;
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
     // Enable recording for Twitter memes
@@ -168,19 +212,55 @@ int main(int argc, char* argv[]) {
     // on, including the shipper's own startup line, lands in the file too.
     // The two are independent: the file always works, the shipper only if a
     // key is present, and losing the network costs you the shipper only.
+    bool loggerOffStdout = false;
     if (std::FILE* logFile =
             std::fopen(Settings::instance().log_path().c_str(), "w")) {
         brls::Logger::setLogOutput(logFile);
+        loggerOffStdout = true;
         brls::Logger::info("DIAGNOSTIC BUILD: file logging to {}",
                            Settings::instance().log_path());
     }
 #endif
+
+    // Verbosity is a file rather than a rebuild. The level set further up is
+    // the default and stays INFO; <working dir>/otel-log-level overrides it
+    // with one of error, warning, info, debug or verbose.
+    //
+    // It is applied here rather than at the original call because the working
+    // directory is not known until Application::init has run. Nothing is lost
+    // by the wait: the exporter subscribes below, so anything logged before
+    // this point was never going to be exported at any level.
+    if (const auto level = readOtelLogLevel(home)) {
+        brls::Logger::setLogLevel(*level);
+        brls::Logger::info("log level set from otel-log-level");
+    }
 
     // Opt in only: does nothing unless <working dir>/otel-endpoint exists.
     if (OtlpLogExporter::instance().start(home)) {
         brls::Logger::info("OTLP log export enabled, endpoint {}",
                            OtlpLogExporter::instance().endpoint());
     }
+
+    // Everything printf writes, which is the part nxlink shows and the log
+    // event does not: moonlight-common-c, ffmpeg and libnx never touch
+    // brls::Logger. Opt in via <working dir>/otel-capture-stdout, and a no-op
+    // unless the exporter above actually started.
+    //
+    // Gated on the logger having been moved off stdout. borealis writes each
+    // line to logOut before firing the event this exports through, and logOut
+    // is stdout by default, so capturing while that is still true would send
+    // every borealis line twice: once as a log record with a real severity,
+    // once as a stdout record without one. If the log file could not be
+    // opened the redirect did not happen, and capture stays off rather than
+    // doubling the volume on the hottest path in the app.
+#ifdef __SWITCH__
+    if (!loggerOffStdout) {
+        brls::Logger::warning(
+            "not capturing stdout: borealis is still logging to it");
+    } else if (StdoutCapture::install(home)) {
+        brls::Logger::info("stdout and stderr are being captured to OTLP");
+    }
+#endif
 
     // Have the application register an action on every activity that will quit
     // when you press BUTTON_START

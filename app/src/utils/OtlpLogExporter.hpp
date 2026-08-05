@@ -74,6 +74,26 @@ class OtlpLogExporter {
 
     [[nodiscard]] bool enabled() const { return m_enabled; }
 
+    /**
+     * Buffers one line that did not come from brls::Logger.
+     *
+     * This is how StdoutCapture hands over raw writes to stdout and stderr:
+     * printf from moonlight-common-c, ffmpeg and libnx, none of which go
+     * anywhere near the borealis log event, and all of which are invisible to
+     * this exporter otherwise. It is what nxlink shows and we do not.
+     *
+     * Recorded at INFO with a source attribute distinguishing it, because a
+     * raw write carries no level. Deliberately NOT routed through
+     * brls::Logger: borealis writes the line to logOut before firing the
+     * event, logOut is stdout by default, and the capture would feed itself.
+     * It also fires that event holding logMtx, so a call back into the logger
+     * from here would deadlock on a non recursive mutex.
+     *
+     * Nothing this reaches may write to stdout or stderr. The invariant is
+     * the same one the worker path holds, and for the same reason.
+     */
+    void logRaw(const std::string& line, bool fromStderr);
+
     /** Resolved endpoint, for logging. Contains no credentials. */
     [[nodiscard]] std::string endpoint() const { return m_endpoint; }
 
@@ -105,7 +125,16 @@ class OtlpLogExporter {
         int severityNumber;
         std::string severityText;
         std::string body;
+        // Empty for anything that came through the borealis log event, which
+        // is the common case. Set to "stdout" or "stderr" for a raw write
+        // picked up by StdoutCapture, and emitted as a log.source attribute
+        // so the two can be told apart in a query. Worth distinguishing:
+        // borealis lines carry a real severity and these do not.
+        std::string source;
     };
+
+    /** Shared tail of onLogLine and logRaw: bounded push plus stats. */
+    void enqueue(Record record);
 
     void onLogLine(brls::Logger::TimePoint when, brls::LogLevel level,
                    const std::string& line);

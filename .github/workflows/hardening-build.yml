@@ -5,7 +5,9 @@ name: Hardening build
 
 on:
   push:
-    branches: [ fix/306-hardening ]
+    branches:
+      - fix/306-hardening
+      - feature/otel-debug-capture
   workflow_dispatch:
 
 permissions:
