@@ -142,6 +142,22 @@ class OtlpTraceExporter {
 };
 
 /**
+ * Writes a one-line breadcrumb to the span journal immediately.
+ *
+ * Spans are only journalled once they end, so the last thing a span can tell
+ * you is that it finished. If the process dies partway through one, the journal
+ * is silent about it, and a teardown that died halfway looks exactly like a
+ * process killed before teardown began.
+ *
+ * Marks close that gap: reaching one and not the next places the failure
+ * between them. Intended for the shutdown path, which is a straight line of
+ * destructors with no natural scopes to wrap.
+ *
+ * Safe to call while unwinding; takes no exporter lock.
+ */
+void otlp_trace_mark(const char* name);
+
+/**
  * Scope guard, so a span cannot be left unclosed on an early return.
  *
  * Names are string literals held by pointer: a span name is a constant in

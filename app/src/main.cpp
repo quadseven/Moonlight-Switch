@@ -350,6 +350,20 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
+    // Everything from here is teardown, and teardown is where the crash report
+    // nyanpasu64 recovered puts the fault: the borealis view tree being
+    // destroyed, dying in a string operation inside ~Box. Nothing down here was
+    // instrumented, so a death in it produced a journal that simply stopped,
+    // which is also what being killed from outside produces.
+    //
+    // These marks make the two distinguishable. Each is written and flushed
+    // where it stands, so the last one present is the last point reached.
+    //
+    // mainLoop() has already returned by now, so the deletion queue borealis
+    // drains on its way out has already run; a journal ending on the previous
+    // run's last span with no mainloop.exited at all means it died in there.
+    otlp_trace_mark("mainloop.exited");
+
     // Stop FIRST, then report. stop() is the final flush and join, and a
     // summary read before it does not count anything that flush sends. That
     // ordering bug produced an exit line of sent=0 on a run where every
@@ -373,10 +387,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    otlp_trace_mark("exporters.stopped");
+
     // Exit
 #if defined(PLATFORM_TVOS)
     exit(0);
 #endif
-    
+
+    // Last thing written from inside main. Anything after this is static
+    // destructors and exit handlers, which is where the recovered trace has
+    // its outermost frames, so a journal whose final line is this one narrows
+    // the fault to that window rather than leaving it open across all of exit.
+    otlp_trace_mark("main.returning");
+
     return EXIT_SUCCESS;
 }

@@ -209,6 +209,35 @@ void journalSpan(const FinishedSpan& f) {
 
 }  // namespace
 
+void otlp_trace_mark(const char* name) {
+    /*
+     * A span is only journalled when it ends, so a span the process dies inside
+     * writes nothing at all. That makes "died halfway through teardown" and
+     * "was killed from outside before teardown started" produce byte-identical
+     * journals, and those two want opposite investigations.
+     *
+     * A mark is written the moment it is reached. Passing one and never
+     * reaching the next is the evidence a span cannot give.
+     *
+     * Deliberately not taking the exporter lock: this runs on paths that are
+     * already unwinding, possibly after another thread has been killed while
+     * holding it, and a breadcrumb that can deadlock is worse than none. The
+     * write is a single fwrite of one line, which stdio serialises internally.
+     */
+    if (!g_journal || !name) {
+        return;
+    }
+    std::string line = "{\"mark\":\"";
+    appendEscaped(line, name);
+    line += "\",\"time\":";
+    line += std::to_string(tickToUnixNano(nowTick()));
+    line += ",\"thread\":";
+    line += std::to_string(currentThreadId());
+    line += "}\n";
+    std::fwrite(line.data(), 1, line.size(), g_journal);
+    std::fflush(g_journal);
+}
+
 OtlpTraceExporter& OtlpTraceExporter::instance() {
     static OtlpTraceExporter e;
     return e;

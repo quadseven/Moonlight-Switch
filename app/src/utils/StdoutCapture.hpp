@@ -46,6 +46,14 @@ namespace StdoutCapture {
  */
 bool install(const std::string& workingDir);
 
+/**
+ * Whether the capture was asked for, without installing anything.
+ *
+ * Lets a caller do whatever setup the capture requires before committing to
+ * it, notably moving the borealis logger off stdout.
+ */
+bool requested(const std::string& workingDir);
+
 /** Whether install() put the capture in place. */
 bool active();
 

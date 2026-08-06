@@ -172,6 +172,11 @@ bool install(const std::string& workingDir) {
 #endif
 }
 
+bool requested(const std::string& workingDir) {
+    std::ifstream flag(workingDir + "/otel-capture-stdout");
+    return flag.good();
+}
+
 bool active() { return g_active; }
 
 }  // namespace StdoutCapture
