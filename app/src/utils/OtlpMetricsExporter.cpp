@@ -20,6 +20,9 @@ constexpr size_t kMaxSeries = 32;
 struct Series {
     const char* name;   /* literal, compared by pointer first then by text */
     int64_t value;
+    /* Counters are reported as the change since the previous export, not as
+     * a running total, so the amount already sent has to be remembered. */
+    int64_t exported;
     bool is_counter;
     bool used;
 };
@@ -50,6 +53,7 @@ Series* findOrCreate(const char* name, bool is_counter) {
     }
     g_series[free_slot].name = name;
     g_series[free_slot].value = 0;
+    g_series[free_slot].exported = 0;
     g_series[free_slot].is_counter = is_counter;
     g_series[free_slot].used = true;
     return &g_series[free_slot];
@@ -73,7 +77,10 @@ void appendEscaped(std::string& out, const char* v) {
 }
 
 bool g_started = false;
-uint64_t g_startUnixNano = 0;
+/* Start of the interval the next export will describe. For delta sums this
+ * moves forward on every flush, because each export covers only the window
+ * since the last one rather than all of time. */
+uint64_t g_intervalStartUnixNano = 0;
 
 }  // namespace
 
@@ -111,9 +118,9 @@ bool OtlpMetricsExporter::start(const std::string& workingDir) {
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        /* A cumulative sum needs a start time that does not move, or a
-         * backend cannot tell a restart from a counter going backwards. */
-        g_startUnixNano = nowUnixNano();
+        /* Opens the first delta interval. Every export closes one and opens
+         * the next, so this is the only time it is set from outside. */
+        g_intervalStartUnixNano = nowUnixNano();
         g_started = true;
     }
 
@@ -191,15 +198,21 @@ std::string OtlpMetricsExporter::takePayload() {
          * that range without losing the low bits, the same reason the
          * timestamps are strings. */
         if (s.is_counter) {
-            /* aggregationTemporality 2 is CUMULATIVE, and isMonotonic says
-             * this only ever goes up, which is what lets a backend compute a
-             * rate and recognise a restart rather than reporting a negative
-             * spike. */
-            out += "\"sum\":{\"aggregationTemporality\":2,\"isMonotonic\":true,";
+            /*
+             * aggregationTemporality 1 is DELTA: this data point is the change
+             * since the previous export, and the interval is start..time.
+             *
+             * Cumulative would be the more usual choice and is what I reached
+             * for first. Datadog's OTLP metrics intake rejects it outright,
+             * which is silent from here because a rejected POST only shows up
+             * in the exporter's own error counter. Nothing arrived for a whole
+             * evening because of it.
+             */
+            out += "\"sum\":{\"aggregationTemporality\":1,\"isMonotonic\":true,";
             out += "\"dataPoints\":[{\"asInt\":\"";
-            out += std::to_string(s.value);
+            out += std::to_string(s.value - s.exported);
             out += "\",\"startTimeUnixNano\":\"";
-            out += std::to_string(g_startUnixNano);
+            out += std::to_string(g_intervalStartUnixNano);
             out += "\",\"timeUnixNano\":\"";
             out += std::to_string(now);
             out += "\"}]}}";
@@ -213,6 +226,17 @@ std::string OtlpMetricsExporter::takePayload() {
     }
 
     out += "]}]}]}";
+
+    /* Everything in this payload is now accounted for. Counters restart their
+     * delta from here; gauges are untouched, since a gauge reports its current
+     * value every interval and is not consumed by being read. */
+    for (size_t i = 0; i < kMaxSeries; i++) {
+        if (g_series[i].used && g_series[i].is_counter) {
+            g_series[i].exported = g_series[i].value;
+        }
+    }
+    g_intervalStartUnixNano = now;
+
     return out;
 }
 
