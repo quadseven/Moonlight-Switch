@@ -40,6 +40,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "OtlpLogExporter.hpp"
 #include "StdoutCapture.hpp"
 #include "OtlpTraceExporter.hpp"
+#include "SwitchExceptionHandler.hpp"
 #include "OtlpMetricsExporter.hpp"
 
 #include "DiscoverManager.hpp"
@@ -272,6 +273,23 @@ int main(int argc, char* argv[]) {
         // up correlated instead of in two unrelated traces.
         OtlpTraceExporter::instance().beginSession("moonlight.session");
     }
+
+    /*
+     * Arm the CPU exception handler with the journal it should write to.
+     *
+     * Unconditional, and after the exporter, because the journal is opened
+     * regardless of whether any network transport was configured. The handler
+     * cannot open a file itself: doing so needs the heap and the filesystem
+     * layer, either of which may be the reason it is running.
+     *
+     * This is what makes "no crash report" mean something. Today that one
+     * observation fits a CPU fault whose report is being lost, the OS
+     * terminating the process after teardown overran its grace period, and a
+     * hang ended by pulling the power. A cpu.exception line in the journal
+     * separates the first from the other two, which is the fork the whole
+     * investigation is stuck on.
+     */
+    switch_exception_handler_arm(OtlpTraceExporter::instance().journalFd());
 
     // Numbers with a known correct answer, for the defects that produce no
     // log line and no span because nothing looked wrong at the time. A

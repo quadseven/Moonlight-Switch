@@ -691,6 +691,11 @@ std::string OtlpTraceExporter::takePayload() {
     return out;
 }
 
+int OtlpTraceExporter::journalFd() const {
+    std::lock_guard<std::mutex> lock(g_journalMutex);
+    return g_journal ? fileno(g_journal) : -1;
+}
+
 bool OtlpTraceExporter::journalWriteFailed() const {
     std::lock_guard<std::mutex> lock(g_journalMutex);
     return g_journalWriteFailed;

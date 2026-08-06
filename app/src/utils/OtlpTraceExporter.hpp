@@ -151,6 +151,14 @@ class OtlpTraceExporter {
      */
     [[nodiscard]] bool journalWriteFailed() const;
 
+    /**
+     * The journal's file descriptor, or -1.
+     *
+     * For the CPU exception handler, which cannot open a file: doing so needs
+     * the heap and the filesystem layer, and either may be why it is running.
+     */
+    [[nodiscard]] int journalFd() const;
+
   private:
     OtlpTraceExporter() = default;
 
