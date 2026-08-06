@@ -105,10 +105,19 @@ void MoonlightSession::connection_terminated(int error_code) {
 
     brls::Logger::info("MoonlightSession: Connection terminated with code: {}", error_code);
 
-    if (!m_active_session)
+    /* The invariant nobody can see from a log: is the static still pointing
+     * at a live session when the termination thread arrives. Recorded rather
+     * than only branched on, so a run where it was already gone is
+     * distinguishable from one where it was fine. */
+    OtlpMetricsExporter::instance().gauge("moonlight.active_session_present",
+                                          m_active_session ? 1 : 0);
+    if (!m_active_session) {
+        otlpSpan.attr("outcome", "no_active_session");
         return;
+    }
 
     if (m_active_session->m_stop_requested) {
+        otlpSpan.attr("outcome", "stop_acknowledged");
         brls::Logger::info("MoonlightSession: Termination acknowledged after stop request");
         m_active_session->m_is_active = false;
         m_active_session->m_is_terminated = true;
@@ -124,9 +133,29 @@ void MoonlightSession::connection_terminated(int error_code) {
         brls::Logger::info("MoonlightSession: Reconnection attempt");
 
         // Connection is already terminated here; avoid toggling the user stop flag.
-        LiStopConnection();
+        //
+        // Both of the calls below happen on the termination thread, and
+        // together they are the 100ms window the main thread was seen
+        // resuming inside. Split so the next crash says which half was
+        // running when the collision happened rather than only that one of
+        // them was.
+        {
+            OtlpSpanScope stopSpan("session.LiStopConnection", &otlpSpan.span());
+            LiStopConnection();
+        }
 
-        m_active_session->start([](const GSResult<bool>& result) {
+        OtlpSpanScope restartSpan("session.restart", &otlpSpan.span());
+
+        /* Read once. Every use below this point in the original code was a
+         * fresh load of a raw static that another thread can clear, so the
+         * pointer could differ between the null check and the call. */
+        MoonlightSession* session = m_active_session;
+        if (!session) {
+            restartSpan.fail("session cleared before restart");
+            return;
+        }
+
+        session->start([](const GSResult<bool>& result) {
             if (result.isSuccess()) {
                 brls::Logger::info("MoonlightSession: Reconnected");
             } else {
@@ -136,7 +165,7 @@ void MoonlightSession::connection_terminated(int error_code) {
                     m_active_session->m_is_terminated = true;
                 }
             }
-        }, m_active_session->m_is_sunshine);
+        }, session->m_is_sunshine);
         return;
     }
 
@@ -389,6 +418,11 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
 }
 
 void MoonlightSession::stop(int terminate_app) {
+    /* Usually the main thread. If this ever overlaps
+     * session.connection_terminated in a trace, the object is being torn
+     * down while the termination thread is still inside it. */
+    OtlpSpanScope otlpSpan("session.stop");
+
     if (m_stop_requested)
         return;
 
