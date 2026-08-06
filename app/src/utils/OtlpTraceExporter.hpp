@@ -142,6 +142,35 @@ class OtlpTraceExporter {
 };
 
 /**
+ * Opens a window in which per-frame spans are worth recording.
+ *
+ * The journal fflush()es every span as it completes, which is what makes it
+ * survive a hang, and is affordable only while spans are lifecycle events a
+ * handful per session. A span on the render path is 60 a second, so recording
+ * it unconditionally means 60 SD card flushes a second, a journal growing by
+ * megabytes a minute, and the lifecycle spans being evicted from the export
+ * buffer by frames. Worse, it perturbs the timing of the race it was added to
+ * observe.
+ *
+ * The frames only mean anything next to a decoder teardown: one drawing while
+ * the other frees is the whole question, and a frame drawn with no teardown in
+ * progress answers nothing. So decoder.cleanup opens this window and the render
+ * path records a span only while it is open. Costs an atomic load per frame in
+ * the normal case and yields exactly the frames that could overlap.
+ */
+class OtlpSpanWindow {
+public:
+    OtlpSpanWindow();
+    ~OtlpSpanWindow();
+
+    OtlpSpanWindow(const OtlpSpanWindow&) = delete;
+    OtlpSpanWindow& operator=(const OtlpSpanWindow&) = delete;
+};
+
+/** Whether any OtlpSpanWindow is currently open, on any thread. */
+[[nodiscard]] bool otlp_span_window_open();
+
+/**
  * Writes a one-line breadcrumb to the span journal immediately.
  *
  * Spans are only journalled once they end, so the last thing a span can tell

@@ -1,5 +1,6 @@
 #include "OtlpTraceExporter.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -208,6 +209,26 @@ void journalSpan(const FinishedSpan& f) {
 }
 
 }  // namespace
+
+namespace {
+/* Opened and closed from the decoder teardown thread, read from the render
+ * thread every frame, so it has to be atomic rather than a plain int. A count
+ * rather than a flag because nothing guarantees one teardown at a time, and a
+ * bool would let the first one to finish close the window on the others. */
+std::atomic<int> g_spanWindows{0};
+}  // namespace
+
+OtlpSpanWindow::OtlpSpanWindow() {
+    g_spanWindows.fetch_add(1, std::memory_order_release);
+}
+
+OtlpSpanWindow::~OtlpSpanWindow() {
+    g_spanWindows.fetch_sub(1, std::memory_order_release);
+}
+
+bool otlp_span_window_open() {
+    return g_spanWindows.load(std::memory_order_acquire) > 0;
+}
 
 void otlp_trace_mark(const char* name) {
     /*

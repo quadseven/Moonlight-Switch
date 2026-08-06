@@ -641,6 +641,11 @@ void FFmpegVideoDecoder::cleanup() {
        render.draw_frame in a trace, the renderer is using a frame this
        function is freeing. */
     OtlpSpanScope otlpSpan("decoder.cleanup");
+    /* Turns on per-frame span recording for as long as this teardown runs. A
+     * frame drawn while nothing is being freed answers nothing, so recording
+     * every frame all session would cost an SD flush per frame to bury the few
+     * that matter. These are those few. */
+    OtlpSpanWindow frameSpanWindow;
     otlp_metric_count_add("moonlight.decoder_alive", -1);
 
     brls::Logger::info("FFmpeg: Cleanup...");

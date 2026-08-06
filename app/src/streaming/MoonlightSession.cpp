@@ -1,4 +1,7 @@
 #include "MoonlightSession.hpp"
+
+#include <optional>
+
 #include "OtlpTraceExporter.hpp"
 #include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
@@ -524,9 +527,20 @@ void MoonlightSession::draw(NVGcontext* vg, int width, int height) {
 
            frames_in_flight is the test: if it is ever non zero while
            decoder.cleanup is open, the two really do overlap. */
+        /* The gauge is unconditional: an in-memory add with no I/O, and it is
+         * what makes frames_in_flight readable at any instant, including from
+         * inside decoder.cleanup. The span is not, because journalling one
+         * costs an SD card flush and this runs once per frame. Recording it
+         * all session would be sixty flushes a second to bury the handful that
+         * mean anything, and would slow the render path enough to move the
+         * timing being measured. decoder.cleanup opens the window; outside it
+         * this is an atomic load and nothing else. */
         otlp_metric_count_add("moonlight.frames_in_flight", 1);
         {
-            OtlpSpanScope frameSpan("render.draw_frame");
+            std::optional<OtlpSpanScope> frameSpan;
+            if (otlp_span_window_open()) {
+                frameSpan.emplace("render.draw_frame");
+            }
             AVFrameHolder::instance().get(
                 [this, vg, width, height](AVFrame* frame) {
                     m_video_renderer->draw(vg, width, height, frame, m_video_format);
