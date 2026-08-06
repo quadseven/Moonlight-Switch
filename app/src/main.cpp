@@ -225,6 +225,14 @@ int main(int argc, char* argv[]) {
     }
     if (std::FILE* logFile =
             std::fopen(Settings::instance().log_path().c_str(), "w")) {
+        // Line buffered, because borealis only fflush()es per line under
+        // __MINGW32__ (logger.hpp) and newlib hands us a fully buffered FILE
+        // otherwise. Without this the tail of the log is wherever stdio
+        // happened to flush, not where the process stopped, and a crash
+        // truncates mid word for reasons that have nothing to do with the
+        // crash. Two comments in this tree previously claimed the opposite
+        // and a real investigation was built on them.
+        setvbuf(logFile, nullptr, _IOLBF, 0);
         brls::Logger::setLogOutput(logFile);
         loggerOffStdout = true;
         brls::Logger::info("DIAGNOSTIC BUILD: file logging to {}",

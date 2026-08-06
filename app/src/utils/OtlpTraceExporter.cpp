@@ -60,8 +60,13 @@ uint64_t g_anchorTick = 0;
  * interval of spans still in memory. Nothing that leaves over the network can
  * survive that.
  *
- * What did survive was the log file, because borealis flushes every line. So
- * the same trick is used here: one JSON object per line, flushed immediately.
+ * The log file is NOT a reliable comparison, whatever an earlier version of
+ * this comment claimed: borealis only fflush()es per line under __MINGW32__,
+ * so on this platform its tail is a stdio buffer boundary rather than the
+ * moment the process stopped. main.cpp now sets _IOLBF to make it honest.
+ *
+ * This journal does not depend on that. One JSON object per line, fwrite then
+ * fflush, on completion of every span.
  * After a hang the card still has the trace right up to the moment the system
  * stopped, which is the only part anyone wants.
  *
