@@ -141,12 +141,21 @@ void MoonlightSession::connection_terminated(int error_code) {
         // them was.
         {
             OtlpSpanScope stopSpan("session.LiStopConnection", &otlpSpan.span());
-            /* Any value above 1 here is the two-thread teardown, directly. */
-            otlp_metric_count_add("moonlight.listop_inflight", 1);
-            otlp_metric_count_add("moonlight.listop_inflight", 1);
-    LiStopConnection();
-    otlp_metric_count_add("moonlight.listop_inflight", -1);
-            otlp_metric_count_add("moonlight.listop_inflight", -1);
+            /*
+             * Any value above 1 is two threads inside LiStopConnection at once,
+             * which is the defect itself rather than evidence of it.
+             *
+             * The count has to be taken at every call site or it cannot mean
+             * that. One thread entering here while another enters through
+             * stop() only reads as 2 if stop() is counted too; counting one
+             * site measures how often that site runs, which nothing needed.
+             *
+             * Scope guard rather than a matched pair of calls, so the release
+             * cannot be skipped by an early return and cannot be duplicated
+             * without the acquire being duplicated with it.
+             */
+            OtlpGaugeScope inflight("moonlight.listop_inflight");
+            LiStopConnection();
         }
 
         OtlpSpanScope restartSpan("session.restart", &otlpSpan.span());
@@ -406,6 +415,12 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
                         &m_video_callbacks, &m_audio_callbacks, NULL, 0, NULL, 0);
 
                     if (result != 0) {
+                        /* Runs on a brls::async thread, so this is a fourth
+                         * way into LiStopConnection and has to be counted like
+                         * the others. A failed start cleaning itself up here
+                         * while the user backs out of the view is two threads
+                         * in the same teardown. */
+                        OtlpGaugeScope inflight("moonlight.listop_inflight");
                         LiStopConnection();
                         callback(
                             GSResult<bool>::failure("error/stream_start"_i18n));
@@ -437,10 +452,16 @@ void MoonlightSession::stop(int terminate_app) {
         GameStreamClient::instance().quit(m_address, [](auto _) {});
     }
 
+    /* The main thread's way in. This is the other half of the pair the count
+     * exists to catch: the guard above is m_stop_requested, and the reconnect
+     * path deliberately does not set it, so nothing here excludes a
+     * termination thread already inside LiStopConnection. */
+    OtlpGaugeScope inflight("moonlight.listop_inflight");
     LiStopConnection();
 }
 
 void MoonlightSession::restart() {
+    OtlpGaugeScope inflight("moonlight.listop_inflight");
     LiStopConnection();
 
     start([](const GSResult<bool>& result) {
