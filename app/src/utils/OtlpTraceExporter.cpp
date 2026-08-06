@@ -1,6 +1,7 @@
 #include "OtlpTraceExporter.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -111,7 +112,26 @@ uint64_t randomU64() {
 #ifdef __SWITCH__
     return randomGet64();
 #else
-    static uint64_t x = 0x2545F4914F6CDD1DULL;
+    /*
+     * Trace and span ids come from here, and they are generated on whichever
+     * thread happens to open a span, so the host fallback has to tolerate that
+     * as much as the console one does. The obvious static xorshift does not:
+     * ThreadSanitizer flags the read-modify-write immediately, and two threads
+     * interleaving in it can return the same value, which for a span id means
+     * two different spans claiming to be one.
+     *
+     * Per-thread state rather than a lock. These are identifiers, not a
+     * sequence anyone depends on, so threads advancing independently is fine,
+     * and it keeps span creation off any shared cache line. Seeded from the
+     * thread's own address so two threads do not start from the same value.
+     */
+    static thread_local uint64_t x = [] {
+        uint64_t seed = 0x2545F4914F6CDD1DULL;
+        seed ^= reinterpret_cast<uintptr_t>(&errno) * 0x9E3779B97F4A7C15ULL;
+        seed ^= static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        return seed ? seed : 0x2545F4914F6CDD1DULL;
+    }();
     x ^= x << 13; x ^= x >> 7; x ^= x << 17;
     return x;
 #endif
