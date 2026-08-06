@@ -215,6 +215,14 @@ int main(int argc, char* argv[]) {
     // The two are independent: the file always works, the shipper only if a
     // key is present, and losing the network costs you the shipper only.
     bool loggerOffStdout = false;
+    // Same reasoning as the span journal: relaunching to inspect a crash used
+    // to destroy the log that described it. One generation is kept.
+    {
+        const std::string logPath = Settings::instance().log_path();
+        const std::string prevPath = logPath + ".prev";
+        std::remove(prevPath.c_str());
+        std::rename(logPath.c_str(), prevPath.c_str());
+    }
     if (std::FILE* logFile =
             std::fopen(Settings::instance().log_path().c_str(), "w")) {
         brls::Logger::setLogOutput(logFile);

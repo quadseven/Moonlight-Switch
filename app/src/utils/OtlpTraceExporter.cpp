@@ -246,10 +246,24 @@ bool OtlpTraceExporter::start(const std::string& workingDir) {
             .count());
     g_anchorTick = nowTick();
 
-    /* Truncated per launch rather than appended to: a journal that grows
-     * across every session on a FAT32 card is a different problem, and the
-     * interesting trace is always the one from the run that just died. */
-    g_journal = std::fopen((workingDir + "/spans.jsonl").c_str(), "w");
+    /*
+     * One generation of history, then truncate.
+     *
+     * Truncating outright loses the crash you are chasing the moment you
+     * relaunch to look at it, which is exactly what happened here: an app
+     * hung, the console was restarted, and the journal describing the hang
+     * was destroyed by the run that went looking for it. Appending forever is
+     * not the answer either, on a card that has to last.
+     *
+     * So the previous run is kept as spans.jsonl.prev. After a crash the
+     * evidence survives one relaunch, which is all it needs to survive.
+     */
+    const std::string journalPath = workingDir + "/spans.jsonl";
+    const std::string previousPath = journalPath + ".prev";
+    std::remove(previousPath.c_str());
+    std::rename(journalPath.c_str(), previousPath.c_str());
+
+    g_journal = std::fopen(journalPath.c_str(), "w");
 
     m_endpoint = endpoint;
     m_enabled = true;
