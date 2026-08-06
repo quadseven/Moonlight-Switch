@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -317,10 +318,11 @@ void testJournalIsWrittenPerSpan() {
 
     const std::string path = g_workDir + "/spans.jsonl";
     for (int i = 1; i <= 3; i++) {
+        const size_t before = countLines(readFile(path));
         OtlpTraceExporter::Span s = tr.begin("journaled", nullptr);
         tr.end(s, "journaled", {});
-        check(countLines(readFile(path)) == static_cast<size_t>(i),
-              "line " + std::to_string(i) + " is readable without a flush");
+        check(countLines(readFile(path)) == before + 1,
+              "span " + std::to_string(i) + " is readable without a flush");
     }
 
     tr.stop();
@@ -338,6 +340,7 @@ void testMarksAreImmediateAndOrdered() {
     tr.start(g_workDir);
 
     const std::string path = g_workDir + "/spans.jsonl";
+    const size_t before = countLines(readFile(path));
     otlp_trace_mark("first");
     check(contains(readFile(path), "\"mark\":\"first\""),
           "the mark is on disk before the next statement runs");
@@ -346,7 +349,7 @@ void testMarksAreImmediateAndOrdered() {
     const std::string doc = readFile(path);
     check(doc.find("\"mark\":\"first\"") < doc.find("\"mark\":\"second\""),
           "marks appear in the order they were reached");
-    check(countLines(doc) == 2, "one line per mark");
+    check(countLines(doc) == before + 2, "one line per mark");
 
     tr.stop();
 }
@@ -359,21 +362,40 @@ void testJournalRotates() {
     TEST("a new run preserves the previous run's journal");
 
     OtlpTraceExporter& tr = OtlpTraceExporter::instance();
-    tr.start(g_workDir);
-    otlp_trace_mark("run.one");
-    tr.stop();
 
-    tr.start(g_workDir);
+    /* Its own directory. The journal is opened once per directory, which is
+     * once per launch on the console, so rotation cannot be observed by
+     * calling start() twice against the same one. */
+    const std::string dir = g_workDir + "/rotate";
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/otel-endpoint") << "https://example.invalid\n";
+
+    tr.openJournal(dir);
+    otlp_trace_mark("run.one");
+
+    /* A second launch, which is a fresh open of the same path. */
+    tr.openJournal(g_workDir);          // move away
+    tr.openJournal(dir);                // and back, as a new run would
+
     otlp_trace_mark("run.two");
 
-    check(contains(readFile(g_workDir + "/spans.jsonl"), "run.two"),
+    check(contains(readFile(dir + "/spans.jsonl"), "run.two"),
           "the current journal holds the current run");
-    check(contains(readFile(g_workDir + "/spans.jsonl.prev"), "run.one"),
+    check(contains(readFile(dir + "/spans.jsonl.prev"), "run.one"),
           "the previous run survives as .prev");
-    check(!contains(readFile(g_workDir + "/spans.jsonl"), "run.one"),
+    check(!contains(readFile(dir + "/spans.jsonl"), "run.one"),
           "the current journal is not appended to the old one");
 
-    tr.stop();
+    /* Rotating with nothing to rotate must not destroy the generation that is
+     * already there. That happens whenever a run never opened a journal, or
+     * the operator pulled spans.jsonl off the card to read it. */
+    std::filesystem::remove(dir + "/spans.jsonl");
+    tr.openJournal(g_workDir);
+    tr.openJournal(dir);
+    check(contains(readFile(dir + "/spans.jsonl.prev"), "run.one"),
+          "a rotation with no source leaves the existing .prev intact");
+
+    tr.openJournal(g_workDir);
 }
 
 /*
@@ -529,9 +551,6 @@ void testDisabledExporterIsInert() {
 
     OtlpTraceExporter& tr = OtlpTraceExporter::instance();
 
-    /* Before start: no journal exists yet, and a mark must not create one. */
-    otlp_trace_mark("before.start");
-
     tr.start(g_workDir);
     OtlpTraceExporter::Span s = tr.begin("straddles.stop", nullptr);
     tr.stop();
@@ -541,8 +560,6 @@ void testDisabledExporterIsInert() {
     otlp_trace_mark("after.stop");
 
     const std::string doc = readFile(g_workDir + "/spans.jsonl");
-    check(!contains(doc, "before.start"),
-          "a mark before start() is not recorded");
     check(!contains(doc, "straddles.stop"),
           "a span ended after stop() is not recorded");
 
@@ -573,6 +590,62 @@ void testSpanWindow() {
     check(!otlp_span_window_open(), "closed once every holder is gone");
 }
 
+/*
+ * Gauges leave this process only over the network, on a worker that parks when
+ * the console loses focus and dies with it. During a sleep and at the moment of
+ * a crash they are unreadable, which is exactly when they are wanted. Marks go
+ * to the card, so they carry the gauges out.
+ *
+ * The peak matters more than the value. listop_inflight is held for about a
+ * hundred milliseconds and frames_in_flight for microseconds, against a ten
+ * second flush, so an instantaneous read is zero almost every time it is taken.
+ * "It was never above 1" is the conclusion the gauge exists to support, and a
+ * point sample says exactly that whether or not the collision happened.
+ */
+void testGaugesRideOnMarks() {
+    TEST("marks carry the gauges, including a peak a point sample would miss");
+
+    OtlpTraceExporter& tr = OtlpTraceExporter::instance();
+    OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
+    tr.start(g_workDir);
+    mx.start(g_workDir);
+    (void)mx.takePayload();  // reset the interval
+
+    /* A collision, opened and closed before anything could sample it. */
+    {
+        OtlpGaugeScope a("test.mark_inflight");
+        OtlpGaugeScope b("test.mark_inflight");
+    }
+
+    otlp_trace_mark("after.the.collision");
+    const std::string doc = readFile(g_workDir + "/spans.jsonl");
+    const size_t markPos = doc.rfind("after.the.collision");
+    check(markPos != std::string::npos, "the mark was written");
+    const std::string markLine = doc.substr(markPos);
+
+    check(contains(markLine, "\"m.test.mark_inflight\":0"),
+          "the mark carries the gauge, which by now has returned to 0");
+    check(contains(markLine, "\"m.test.mark_inflight.peak\":2"),
+          "and the peak of 2, which is the collision a point sample cannot see");
+
+    /* The same peak must reach the network payload, as its own series. */
+    const std::string payload = mx.takePayload();
+    check(contains(payload, "test.mark_inflight.peak"),
+          "the peak is exported as its own metric series");
+    check(contains(payload, "\"asInt\":\"2\""), "carrying the value 2");
+
+    /* And after an export the peak restarts from the current value, not from
+     * zero, or anything still held open across a flush would report a peak
+     * below its own current value. */
+    (void)mx.takePayload();
+    const std::string third = mx.takePayload();
+    check(!contains(third, "\"asInt\":\"2\""),
+          "the peak does not persist into later intervals");
+
+    tr.stop();
+    mx.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -590,6 +663,7 @@ int main() {
     testPayloadEscaping();
     testTimestampsAreStringsAndPlausible();
     testSpanWindow();
+    testGaugesRideOnMarks();
     testConcurrentUse();
     testDisabledExporterIsInert();
 

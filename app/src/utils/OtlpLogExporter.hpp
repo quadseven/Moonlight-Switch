@@ -179,4 +179,9 @@ class OtlpLogExporter {
     mutable std::mutex m_statsMutex;
     Stats m_stats {};
     std::string m_lastError;
+
+    /* Set once the worker has made its final pass with m_stopping set, so the
+     * pass that drains spans and metrics happens exactly once and the loop
+     * still terminates. */
+    bool m_finalFlushDone = false;
 };

@@ -856,8 +856,28 @@ int FFmpegVideoDecoder::submit_decode_unit(PDECODE_UNIT decode_unit) {
 
         }
         else {
+            /*
+             * A frame failed to decode, which is what a dying network produces,
+             * and the response is to restart the whole session from inside a
+             * moonlight-common-c video callback, on its decoder thread.
+             *
+             * This path left nothing behind. restart() carries a gauge, and
+             * gauges leave only over the network, on a worker that parks the
+             * moment focus is lost. Pull the network mid-stream and the journal
+             * shows connection_terminated closing normally and then silence,
+             * which is indistinguishable from being killed, and is the
+             * signature actually observed.
+             *
+             * Marks rather than a span, because restart() calls
+             * LiStopConnection, which tears down and joins the video decoder
+             * threads including the one running this. If it hangs there a span
+             * would never end and would write nothing; a mark is already on the
+             * card before the call is made.
+             */
+            otlp_trace_mark("decoder.restart.requested");
             if (MoonlightSession::activeSession() != nullptr)
                 MoonlightSession::activeSession()->restart();
+            otlp_trace_mark("decoder.restart.returned");
         }
     } else {
         brls::Logger::error("FFmpeg: Big buffer to decode... 2");

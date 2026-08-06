@@ -392,8 +392,28 @@ void OtlpLogExporter::worker() {
                 m_records.pop_front();
             }
 
+            /*
+             * Leaving on an empty log batch here discards whatever spans and
+             * metrics are still buffered, and this is the last pass before the
+             * worker exits.
+             *
+             * Same mistake as shipping spans after the empty-batch check
+             * further down, one level up and with worse consequences. Set
+             * otel-log-level to error, have a session that logs no errors, and
+             * every span produced during teardown is dropped on the way out:
+             * the journal on the card holds them and the backend never sees
+             * them. It also fires on an ordinary shutdown, where the final log
+             * batch ships, the loop re-enters, finds nothing, and leaves
+             * without flushing what teardown produced after it.
+             *
+             * The flag is cleared below once the other two signals have had
+             * their turn, so this still terminates after exactly one more pass.
+             */
             if (batch.empty() && m_stopping) {
-                return;
+                if (m_finalFlushDone) {
+                    return;
+                }
+                m_finalFlushDone = true;
             }
         }
 

@@ -1,5 +1,7 @@
 #include "OtlpTraceExporter.hpp"
 
+#include "OtlpMetricsExporter.hpp"
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -78,6 +80,9 @@ uint64_t g_anchorTick = 0;
  * diagnostic.
  */
 std::FILE* g_journal = nullptr;
+/* Path g_journal was opened from, so a repeat call for the same directory is
+ * a no-op rather than a second rotation. */
+std::string g_journalPath;
 
 uint64_t nowTick() {
 #ifdef __SWITCH__
@@ -274,6 +279,12 @@ void otlp_trace_mark(const char* name) {
     line += std::to_string(tickToUnixNano(nowTick()));
     line += ",\"thread\":";
     line += std::to_string(currentThreadId());
+    /* Gauges ride along. They otherwise leave only over the network, on a
+     * worker that parks when the console loses focus and dies with the
+     * process, so at the moment a breadcrumb is worth reading they are
+     * unreadable. listop_inflight above 1 is the defect itself; this is what
+     * lets it be read off the card with no working network at any point. */
+    line += otlp_metrics_snapshot();
     line += "}\n";
     std::fwrite(line.data(), 1, line.size(), g_journal);
     std::fflush(g_journal);
@@ -285,15 +296,39 @@ OtlpTraceExporter& OtlpTraceExporter::instance() {
 }
 
 bool OtlpTraceExporter::start(const std::string& workingDir) {
-    std::ifstream f(workingDir + "/otel-endpoint");
-    if (!f.good()) {
-        return false;
-    }
+    /*
+     * The journal is opened before any of this, and regardless of how it goes.
+     *
+     * Recording and shipping used to be one decision: no otel-endpoint file
+     * meant an early return here, which meant no spans.jsonl, no marks, and no
+     * log line saying so. The card is the only store that survives a hang, and
+     * it was switched off by the absence of a network setting. Worse, the
+     * result was indistinguishable from the failure being investigated: a
+     * perfectly clean run would produce an empty journal, which reads as having
+     * died before the first breadcrumb.
+     *
+     * Shipping over the network is allowed to fail. Writing to the card the
+     * console is already running from is not the same kind of risk, and it is
+     * the half that matters when everything else is gone.
+     */
+    openJournal(workingDir);
+
     std::string endpoint;
-    std::getline(f, endpoint);
+    {
+        std::ifstream f(workingDir + "/otel-endpoint");
+        if (f.good()) {
+            std::getline(f, endpoint);
+        }
+    }
 
     const auto begin = endpoint.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
+        /* No transport. Still recording: the journal is open, spans and marks
+         * land on the card, and takePayload simply has nowhere to send them.
+         * Returning false so the caller can say so rather than claim export
+         * is enabled. */
+        m_enabled = true;
+        m_endpoint.clear();
         return false;
     }
     const auto last = endpoint.find_last_not_of(" \t\r\n");
@@ -315,6 +350,34 @@ bool OtlpTraceExporter::start(const std::string& workingDir) {
         endpoint += tracesSuffix;
     }
 
+    m_endpoint = endpoint;
+    m_enabled = true;
+    return true;
+}
+
+void OtlpTraceExporter::openJournal(const std::string& workingDir) {
+    /*
+     * Idempotent for the same directory, because start() calls this and so does
+     * main before it, and rotating twice on one launch would throw away the
+     * previous run for nothing.
+     *
+     * A different directory reopens. That does not happen on the console, where
+     * this runs once during startup before any other thread exists, which is
+     * also why the swap is safe: otlp_trace_mark reads g_journal without the
+     * lock, deliberately, and that is only sound while nothing reopens it
+     * underneath a running app.
+     */
+    const std::string journalPath = workingDir + "/spans.jsonl";
+    if (g_journal) {
+        if (g_journalPath == journalPath) {
+            return;
+        }
+        std::FILE* old = g_journal;
+        g_journal = nullptr;
+        std::fclose(old);
+    }
+    g_journalPath = journalPath;
+
     g_anchorUnixNano = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -333,16 +396,40 @@ bool OtlpTraceExporter::start(const std::string& workingDir) {
      * So the previous run is kept as spans.jsonl.prev. After a crash the
      * evidence survives one relaunch, which is all it needs to survive.
      */
-    const std::string journalPath = workingDir + "/spans.jsonl";
     const std::string previousPath = journalPath + ".prev";
-    std::remove(previousPath.c_str());
-    std::rename(journalPath.c_str(), previousPath.c_str());
+
+    /* Rotate only if there is something to rotate. Removing .prev first and
+     * then renaming a file that is not there deletes a generation and puts
+     * nothing in its place, which is a net loss of evidence for no reason.
+     * That happens whenever the last run never opened a journal, or the
+     * operator pulled spans.jsonl off the card to read it. */
+    std::ifstream existing(journalPath);
+    if (existing.good()) {
+        existing.close();
+        std::remove(previousPath.c_str());
+        std::rename(journalPath.c_str(), previousPath.c_str());
+    }
 
     g_journal = std::fopen(journalPath.c_str(), "w");
 
-    m_endpoint = endpoint;
-    m_enabled = true;
-    return true;
+    /*
+     * A header line, so a journal can be identified later.
+     *
+     * A crash report names offsets into a build, and a journal describes a run
+     * of one, and until now nothing tied either to the other. The anchor
+     * matters too: every timestamp in this file is derived from it, and
+     * without it a reader cannot re-derive when anything happened if the clock
+     * moved.
+     */
+    if (g_journal) {
+        std::string line = "{\"run\":\"start\",\"anchorUnixNano\":";
+        line += std::to_string(g_anchorUnixNano);
+        line += ",\"anchorTick\":";
+        line += std::to_string(g_anchorTick);
+        line += "}\n";
+        std::fwrite(line.data(), 1, line.size(), g_journal);
+        std::fflush(g_journal);
+    }
 }
 
 void OtlpTraceExporter::stop() {

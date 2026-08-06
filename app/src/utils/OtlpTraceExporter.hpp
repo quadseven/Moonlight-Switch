@@ -54,6 +54,17 @@ class OtlpTraceExporter {
 
     /** Reads config from workingDir. Inert unless otel-endpoint exists. */
     bool start(const std::string& workingDir);
+
+    /**
+     * Opens the SD journal, independently of any network configuration.
+     *
+     * Called by start(), and safe to call before it. Recording to the card and
+     * shipping over the network used to be one decision, so a missing
+     * otel-endpoint produced no journal at all: the only store that survives a
+     * hang was switched off by the absence of a network setting, and the
+     * result looked exactly like a run that died before its first breadcrumb.
+     */
+    void openJournal(const std::string& workingDir);
     void stop();
 
     [[nodiscard]] bool enabled() const { return m_enabled; }

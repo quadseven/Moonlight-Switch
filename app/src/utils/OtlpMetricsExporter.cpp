@@ -23,6 +23,23 @@ struct Series {
     /* Counters are reported as the change since the previous export, not as
      * a running total, so the amount already sent has to be remembered. */
     int64_t exported;
+    /*
+     * Highest value seen since the last export.
+     *
+     * A gauge is sampled once per flush, and the flush interval is ten
+     * seconds. The two gauges that matter most are not observable that way:
+     * frames_in_flight is raised and lowered around a single frame fetch,
+     * microseconds apart, and listop_inflight is held for about a hundred
+     * milliseconds. Sampling either every ten seconds reads zero essentially
+     * always.
+     *
+     * That is worse than having no metric. "listop_inflight was never above 1"
+     * is the conclusion the instrument exists to support, and a point sample
+     * produces exactly that reading whether or not the collision happened. The
+     * peak is what actually answers the question, because it cannot be missed
+     * by looking at the wrong instant.
+     */
+    int64_t peak;
     bool is_counter;
     bool used;
 };
@@ -54,6 +71,7 @@ Series* findOrCreate(const char* name, bool is_counter) {
     g_series[free_slot].name = name;
     g_series[free_slot].value = 0;
     g_series[free_slot].exported = 0;
+    g_series[free_slot].peak = 0;
     g_series[free_slot].is_counter = is_counter;
     g_series[free_slot].used = true;
     return &g_series[free_slot];
@@ -141,6 +159,9 @@ void OtlpMetricsExporter::gauge(const char* name, int64_t value) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (Series* s = findOrCreate(name, false)) {
         s->value = value;
+        if (value > s->peak) {
+            s->peak = value;
+        }
     }
 }
 
@@ -222,6 +243,19 @@ std::string OtlpMetricsExporter::takePayload() {
             out += "\",\"timeUnixNano\":\"";
             out += std::to_string(now);
             out += "\"}]}}";
+
+            /* And the peak, as its own series. The instantaneous value answers
+             * "what is it now", which for a count held across a hundred
+             * millisecond teardown is almost always zero when the ten second
+             * flush happens to look. The peak answers "did it ever", which is
+             * the question every one of these gauges was added to settle. */
+            out += ",{\"name\":\"";
+            appendEscaped(out, s.name);
+            out += ".peak\",\"unit\":\"1\",\"gauge\":{\"dataPoints\":[{\"asInt\":\"";
+            out += std::to_string(s.peak);
+            out += "\",\"timeUnixNano\":\"";
+            out += std::to_string(now);
+            out += "\"}]}}";
         }
     }
 
@@ -234,9 +268,48 @@ std::string OtlpMetricsExporter::takePayload() {
         if (g_series[i].used && g_series[i].is_counter) {
             g_series[i].exported = g_series[i].value;
         }
+        /* The peak describes one interval, so it restarts from wherever the
+         * value actually is rather than from zero. Resetting to zero would
+         * report a peak below the current value for anything still held open
+         * across a flush, which is the normal state of a live count. */
+        g_series[i].peak = g_series[i].value;
     }
     g_intervalStartUnixNano = now;
 
+    return out;
+}
+
+std::string otlp_metrics_snapshot() {
+    /*
+     * Every gauge, as JSON fields, for embedding in a line of the span journal.
+     *
+     * Metrics only leave this process over the network, on a worker that parks
+     * itself the moment the console loses focus and dies with the process. So
+     * during a sleep, and at the moment of a crash, every gauge is unreadable:
+     * the numbers built to identify the defect are dark exactly when it fires.
+     *
+     * The journal is the one store that survives. Writing the gauges into a
+     * breadcrumb costs a few dozen bytes and makes listop_inflight readable
+     * from the card afterwards, with no working network at any point.
+     */
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::string out;
+    for (size_t i = 0; i < kMaxSeries; i++) {
+        const Series& s = g_series[i];
+        if (!s.used) {
+            continue;
+        }
+        out += ",\"m.";
+        appendEscaped(out, s.name);
+        out += "\":";
+        out += std::to_string(s.value);
+        if (!s.is_counter && s.peak != s.value) {
+            out += ",\"m.";
+            appendEscaped(out, s.name);
+            out += ".peak\":";
+            out += std::to_string(s.peak);
+        }
+    }
     return out;
 }
 
@@ -256,5 +329,8 @@ void otlp_metric_count_add(const char* name, int64_t delta) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (Series* s = findOrCreate(name, false)) {
         s->value += delta;
+        if (s->value > s->peak) {
+            s->peak = s->value;
+        }
     }
 }

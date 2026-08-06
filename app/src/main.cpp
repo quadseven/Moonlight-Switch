@@ -341,6 +341,29 @@ int main(int argc, char* argv[]) {
 #ifdef __PSV__
     bool vitaHealthReported = false;
 #endif
+    /*
+     * Breadcrumbs around borealis' own shutdown, because mainLoop() returning
+     * is far too late to learn anything from.
+     *
+     * Application::exit() is called from inside internalMainLoop, at
+     * application.cpp:209, and mainLoop() only returns false afterwards. By
+     * then exitEvent has fired and the entire view tree has been destroyed:
+     * clear(), then the deletion pool drain that runs every ~Activity,
+     * ~AppletFrame, ~Box and ~MainTabs. That drain is where the crash report
+     * recovered upstream has its innermost frames.
+     *
+     * So mainloop.exited, below, is a post-mortem. Everything it was meant to
+     * distinguish has already happened by the time it is written, and a death
+     * inside teardown produced a journal identical to being killed mid-stream.
+     * These three run at the boundaries that actually matter.
+     */
+    brls::Application::getWindowShouldCloseEvent()->subscribe(
+        [] { otlp_trace_mark("applet.exit_requested"); });
+    brls::Application::getExitEvent()->subscribe(
+        [] { otlp_trace_mark("borealis.teardown.entered"); });
+    brls::Application::getExitDoneEvent()->subscribe(
+        [] { otlp_trace_mark("borealis.teardown.done"); });
+
     while (brls::Application::mainLoop()) {
 #ifdef __PSV__
         if (!vitaHealthReported) {

@@ -97,3 +97,18 @@ class OtlpGaugeScope {
  * session that exists until it is torn down.
  */
 void otlp_metric_count_add(const char* name, int64_t delta);
+
+/**
+ * Every gauge's current value, and its peak, as JSON fields for the span
+ * journal.
+ *
+ * Metrics leave this process only over the network, on a worker that parks
+ * when the console loses focus and dies with the process. During a sleep and
+ * at the moment of a crash the gauges are unreadable, which is precisely when
+ * they are wanted. The journal on the card survives both; this is what lets a
+ * breadcrumb carry them.
+ *
+ * Each field is prefixed "m." and begins with a comma, so it appends directly
+ * inside an existing JSON object.
+ */
+[[nodiscard]] std::string otlp_metrics_snapshot();
