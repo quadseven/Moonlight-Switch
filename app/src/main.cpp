@@ -378,9 +378,20 @@ int main(int argc, char* argv[]) {
     if (otlpWasEnabled) {
         const auto stats = OtlpLogExporter::instance().stats();
         brls::Logger::info("OTLP: accepted={} sent={} droppedFailed={} "
-                           "droppedOverflow={} postFailures={}",
+                           "droppedOverflow={} postFailures={} "
+                           "tracePostFailures={} metricPostFailures={}",
                            stats.accepted, stats.sent, stats.droppedFailed,
-                           stats.droppedOverflow, stats.postFailures);
+                           stats.droppedOverflow, stats.postFailures,
+                           stats.tracePostFailures, stats.metricPostFailures);
+
+        // Spans reaching the card but not the backend is a real state and used
+        // to be an invisible one: the journal looks healthy while APM stays
+        // empty. Saying how many were produced next to how many POSTs were
+        // refused separates "nothing happened" from "nothing arrived".
+        const auto traceStats = OtlpTraceExporter::instance().stats();
+        brls::Logger::info("OTLP traces: started={} ended={} droppedOverflow={}",
+                           traceStats.started, traceStats.ended,
+                           traceStats.droppedOverflow);
         const std::string lastError = OtlpLogExporter::instance().lastError();
         if (!lastError.empty()) {
             brls::Logger::error("OTLP: last transport error: {}", lastError);

@@ -397,14 +397,11 @@ void OtlpLogExporter::worker() {
             }
         }
 
-        if (batch.empty()) {
-            continue;
-        }
-
         if (m_suspended && !m_stopping) {
             // Focus was lost after the batch was taken. Put it back rather
             // than posting into a network that is going away; the records are
-            // still wanted, just not now.
+            // still wanted, just not now. Spans and metrics are skipped for
+            // the same reason, by falling through to the next wait.
             std::lock_guard<std::mutex> lock(m_mutex);
             while (!batch.empty()) {
                 m_records.push_front(std::move(batch.back()));
@@ -413,19 +410,24 @@ void OtlpLogExporter::worker() {
             continue;
         }
 
-        const std::string payload = buildPayload(batch);
-        const bool ok = !payload.empty() && post(m_endpoint, payload);
-
         /* Spans ride the same worker rather than getting a thread of their
          * own. That is not just thrift: this loop already parks while the
          * console is suspended, and a trace POST left in curl across a sleep
          * would hang the process exactly the way the log POST used to. One
          * place that knows when the network is safe to touch is worth more
-         * than a second exporter that has to learn it again. */
+         * than a second exporter that has to learn it again.
+         *
+         * Shipped before the empty-batch check below, not after. Sharing a
+         * worker was meant to share the network's schedule, not to make spans
+         * conditional on log traffic: with this after the check, an interval
+         * where nothing logged shipped no spans and no metrics either, and a
+         * quiet stretch is exactly when a stream is running normally. */
         if (OtlpTraceExporter::instance().enabled()) {
             const std::string spans = OtlpTraceExporter::instance().takePayload();
-            if (!spans.empty()) {
-                post(OtlpTraceExporter::instance().endpoint(), spans);
+            if (!spans.empty() &&
+                !post(OtlpTraceExporter::instance().endpoint(), spans)) {
+                std::lock_guard<std::mutex> statsLock(m_statsMutex);
+                m_stats.tracePostFailures++;
             }
         }
 
@@ -434,10 +436,19 @@ void OtlpLogExporter::worker() {
          * count that is wrong stays visible rather than appearing once. */
         if (OtlpMetricsExporter::instance().enabled()) {
             const std::string m = OtlpMetricsExporter::instance().takePayload();
-            if (!m.empty()) {
-                post(OtlpMetricsExporter::instance().endpoint(), m);
+            if (!m.empty() &&
+                !post(OtlpMetricsExporter::instance().endpoint(), m)) {
+                std::lock_guard<std::mutex> statsLock(m_statsMutex);
+                m_stats.metricPostFailures++;
             }
         }
+
+        if (batch.empty()) {
+            continue;
+        }
+
+        const std::string payload = buildPayload(batch);
+        const bool ok = !payload.empty() && post(m_endpoint, payload);
 
         // Scoped so m_statsMutex is released before m_mutex is taken below.
         // onLogLine() takes m_mutex first, so holding both here in the other

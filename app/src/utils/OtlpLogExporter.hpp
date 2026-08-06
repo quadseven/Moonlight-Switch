@@ -103,6 +103,12 @@ class OtlpLogExporter {
         size_t droppedOverflow;
         size_t droppedFailed;
         size_t postFailures;
+        // Spans and metrics ship on this worker too, and their POST results
+        // used to be discarded. A rejected payload then looked exactly like an
+        // idle app: nothing arrives, nothing complains. Counted so the exit
+        // summary can say the transport was refused rather than stay silent.
+        size_t tracePostFailures;
+        size_t metricPostFailures;
     };
 
     [[nodiscard]] Stats stats() const;

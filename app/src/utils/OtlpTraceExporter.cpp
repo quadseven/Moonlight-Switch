@@ -321,6 +321,32 @@ OtlpTraceExporter::Span OtlpTraceExporter::begin(const char* name,
         s.traceHi = parent->traceHi;
         s.traceLo = parent->traceLo;
         s.parentId = parent->spanId;
+
+        /*
+         * The session root is a trace id, not a parent.
+         *
+         * It spans the whole run, so it only ends when the run does, which
+         * means it is the last span to ship and on a crash it never ships at
+         * all. Datadog drops a span whose parent it has not received: posting
+         * one with a dangling parentSpanId returns 200 and then the span is
+         * simply never queryable. Verified against the intake directly, an
+         * otherwise identical span with no parent arrives and one naming an
+         * unsent parent does not.
+         *
+         * Every span here was parented to that root, so the entire trace was
+         * being discarded on arrival, on clean exits as much as on crashes.
+         * Inheriting the trace id still groups a session together; dropping
+         * the link makes each top level span a root that stands on its own.
+         *
+         * Real nesting below the root keeps its parent, since those parents
+         * are ordinary spans that end during the run.
+         */
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_sessionRoot.valid && s.parentId == g_sessionRoot.spanId) {
+                s.parentId = 0;
+            }
+        }
     } else {
         s.traceHi = randomU64();
         s.traceLo = randomU64();
