@@ -1,5 +1,6 @@
 #include "MoonlightSession.hpp"
 #include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "GameStreamClient.hpp"
 #include "InputManager.hpp"
@@ -90,6 +91,10 @@ void MoonlightSession::connection_started() {
 }
 
 void MoonlightSession::connection_terminated(int error_code) {
+    /* Every arrival, including the repeats from multiple threads that show
+       up before a crash. The count is the signal; one is routine. */
+    OtlpMetricsExporter::instance().increment("moonlight.connection_terminated");
+
     /* This runs on a detached thread that moonlight-common-c spawns, which is
      * the whole reason it is worth a span. When it overlaps the main thread
      * resuming the app, a log gives two lines 3ms apart and no way to tell
@@ -112,6 +117,10 @@ void MoonlightSession::connection_terminated(int error_code) {
 
     if (error_code != 0) {
         otlpSpan.attr("outcome", "reconnect_attempt");
+        /* Counts every reconnect the session attempts on its own. A rate on
+           this separates "the network blipped once" from the repeated
+           termination storm that precedes the hang. */
+        OtlpMetricsExporter::instance().increment("moonlight.reconnect_attempts");
         brls::Logger::info("MoonlightSession: Reconnection attempt");
 
         // Connection is already terminated here; avoid toggling the user stop flag.

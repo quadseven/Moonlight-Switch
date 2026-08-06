@@ -1,5 +1,6 @@
 #include "OtlpLogExporter.hpp"
 #include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -404,6 +405,16 @@ void OtlpLogExporter::worker() {
             const std::string spans = OtlpTraceExporter::instance().takePayload();
             if (!spans.empty()) {
                 post(OtlpTraceExporter::instance().endpoint(), spans);
+            }
+        }
+
+        /* Metrics on the same schedule. Unlike logs and spans these are not
+         * drained: a gauge reports its current value every interval, so a
+         * count that is wrong stays visible rather than appearing once. */
+        if (OtlpMetricsExporter::instance().enabled()) {
+            const std::string m = OtlpMetricsExporter::instance().takePayload();
+            if (!m.empty()) {
+                post(OtlpMetricsExporter::instance().endpoint(), m);
             }
         }
 

@@ -40,6 +40,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "OtlpLogExporter.hpp"
 #include "StdoutCapture.hpp"
 #include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
@@ -254,6 +255,15 @@ int main(int argc, char* argv[]) {
         // on the detached termination thread and work on the main thread end
         // up correlated instead of in two unrelated traces.
         OtlpTraceExporter::instance().beginSession("moonlight.session");
+    }
+
+    // Numbers with a known correct answer, for the defects that produce no
+    // log line and no span because nothing looked wrong at the time. A
+    // subscription held twice where one was intended is a working program
+    // right up until it corrupts memory.
+    if (OtlpMetricsExporter::instance().start(home)) {
+        brls::Logger::info("OTLP metric export enabled, endpoint {}",
+                           OtlpMetricsExporter::instance().endpoint());
     }
 
     // Everything printf writes, which is the part nxlink shows and the log

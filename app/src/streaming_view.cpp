@@ -11,6 +11,7 @@
 
 #include "streaming_view.hpp"
 #include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "InputManager.hpp"
 #include "click_gesture_recognizer.hpp"
@@ -110,6 +111,11 @@ StreamingView::StreamingView(const Host& host, const AppInfo& app) : host(host),
             }, result.value().isSunshine());
         });
 
+    /* The invariant: exactly one focus subscription per live view. A
+       reviewer found this held five at once by opening and closing the
+       overlay and counting them in gdb. As a gauge it does not need finding. */
+    otlp_metric_count_add("moonlight.focus_subscriptions", 1);
+    otlp_metric_count_add("moonlight.streaming_views", 1);
     windowFocusSubscription =
         Application::getWindowFocusChangedEvent()->subscribe(
             [this](bool focused) { this->onWindowFocusChanged(focused); });
@@ -622,6 +628,7 @@ void StreamingView::onLayout() {
 }
 
 StreamingView::~StreamingView() {
+    otlp_metric_count_add("moonlight.streaming_views", -1);
 #ifdef PLATFORM_TVOS
     updatePreferredDisplayMode(false);
 #endif
@@ -629,6 +636,7 @@ StreamingView::~StreamingView() {
     Application::getPlatform()->disableScreenDimming(false);
     Application::getWindowFocusChangedEvent()->unsubscribe(
         windowFocusSubscription);
+    otlp_metric_count_add("moonlight.focus_subscriptions", -1);
     Application::getPlatform()
         ->getInputManager()
         ->getKeyboardKeyStateChanged()
