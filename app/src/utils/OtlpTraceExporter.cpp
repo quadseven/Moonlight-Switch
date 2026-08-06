@@ -1,6 +1,7 @@
 #include "OtlpTraceExporter.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -49,6 +50,27 @@ size_t g_dropped = 0;
  */
 uint64_t g_anchorUnixNano = 0;
 uint64_t g_anchorTick = 0;
+
+/*
+ * Spans are also appended to a file on the SD card as they complete.
+ *
+ * This is not redundancy for its own sake. The crash this exists for took the
+ * whole console down, not just the process: nothing was written to
+ * crash_reports or fatal_errors, and the exporter died with up to a full flush
+ * interval of spans still in memory. Nothing that leaves over the network can
+ * survive that.
+ *
+ * What did survive was the log file, because borealis flushes every line. So
+ * the same trick is used here: one JSON object per line, flushed immediately.
+ * After a hang the card still has the trace right up to the moment the system
+ * stopped, which is the only part anyone wants.
+ *
+ * This is affordable only because the instrumented spans are lifecycle events,
+ * a handful per session. Do not put a span on a per-frame path without turning
+ * this off first; an fflush per frame would be a bottleneck rather than a
+ * diagnostic.
+ */
+std::FILE* g_journal = nullptr;
 
 uint64_t nowTick() {
 #ifdef __SWITCH__
@@ -137,6 +159,49 @@ void appendStringAttr(std::string& out, const std::string& k,
     out += "\"}}";
 }
 
+void journalSpan(const FinishedSpan& f) {
+    if (!g_journal) {
+        return;
+    }
+    std::string line = "{\"name\":\"";
+    appendEscaped(line, f.name);
+    line += "\",\"start\":";
+    line += std::to_string(f.startUnixNano);
+    line += ",\"end\":";
+    line += std::to_string(f.endUnixNano);
+    line += ",\"thread\":";
+    line += std::to_string(f.threadId);
+    line += ",\"trace\":\"";
+    appendHex64(line, f.traceHi);
+    appendHex64(line, f.traceLo);
+    line += "\",\"span\":\"";
+    appendHex64(line, f.spanId);
+    line += "\"";
+    if (f.parentId) {
+        line += ",\"parent\":\"";
+        appendHex64(line, f.parentId);
+        line += "\"";
+    }
+    if (!f.error.empty()) {
+        line += ",\"error\":\"";
+        appendEscaped(line, f.error);
+        line += "\"";
+    }
+    for (const auto& kv : f.attrs) {
+        line += ",\"";
+        appendEscaped(line, kv.first);
+        line += "\":\"";
+        appendEscaped(line, kv.second);
+        line += "\"";
+    }
+    line += "}\n";
+
+    std::fwrite(line.data(), 1, line.size(), g_journal);
+    /* The whole point. Without this the tail of the trace sits in a stdio
+     * buffer and dies with the console. */
+    std::fflush(g_journal);
+}
+
 }  // namespace
 
 OtlpTraceExporter& OtlpTraceExporter::instance() {
@@ -180,6 +245,12 @@ bool OtlpTraceExporter::start(const std::string& workingDir) {
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     g_anchorTick = nowTick();
+
+    /* Truncated per launch rather than appended to: a journal that grows
+     * across every session on a FAT32 card is a different problem, and the
+     * interesting trace is always the one from the run that just died. */
+    g_journal = std::fopen((workingDir + "/spans.jsonl").c_str(), "w");
+
     m_endpoint = endpoint;
     m_enabled = true;
     return true;
@@ -271,6 +342,7 @@ void OtlpTraceExporter::end(
         g_spans.pop_front();
         g_dropped++;
     }
+    journalSpan(f);
     g_spans.push_back(std::move(f));
     g_ended++;
 }
@@ -299,6 +371,7 @@ void OtlpTraceExporter::endError(
         g_spans.pop_front();
         g_dropped++;
     }
+    journalSpan(f);
     g_spans.push_back(std::move(f));
     g_ended++;
 }

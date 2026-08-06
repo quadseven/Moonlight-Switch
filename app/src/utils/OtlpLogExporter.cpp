@@ -1,4 +1,5 @@
 #include "OtlpLogExporter.hpp"
+#include "OtlpTraceExporter.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -391,7 +392,20 @@ void OtlpLogExporter::worker() {
         }
 
         const std::string payload = buildPayload(batch);
-        const bool ok = !payload.empty() && post(payload);
+        const bool ok = !payload.empty() && post(m_endpoint, payload);
+
+        /* Spans ride the same worker rather than getting a thread of their
+         * own. That is not just thrift: this loop already parks while the
+         * console is suspended, and a trace POST left in curl across a sleep
+         * would hang the process exactly the way the log POST used to. One
+         * place that knows when the network is safe to touch is worth more
+         * than a second exporter that has to learn it again. */
+        if (OtlpTraceExporter::instance().enabled()) {
+            const std::string spans = OtlpTraceExporter::instance().takePayload();
+            if (!spans.empty()) {
+                post(OtlpTraceExporter::instance().endpoint(), spans);
+            }
+        }
 
         // Scoped so m_statsMutex is released before m_mutex is taken below.
         // onLogLine() takes m_mutex first, so holding both here in the other
@@ -514,7 +528,7 @@ OtlpLogExporter::buildPayload(const std::deque<Record>& batch) const {
     return payload;
 }
 
-bool OtlpLogExporter::post(const std::string& body) {
+bool OtlpLogExporter::post(const std::string& url, const std::string& body) {
     CURL* curl = curl_easy_init();
     if (!curl) {
         return false;
@@ -528,7 +542,7 @@ bool OtlpLogExporter::post(const std::string& body) {
         headers = curl_slist_append(headers, line.c_str());
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, m_endpoint.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());

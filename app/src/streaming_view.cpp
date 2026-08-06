@@ -10,6 +10,7 @@
 #endif
 
 #include "streaming_view.hpp"
+#include "OtlpTraceExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "InputManager.hpp"
 #include "click_gesture_recognizer.hpp"
@@ -291,6 +292,11 @@ void StreamingView::onFocusLost() {
 void StreamingView::onWindowFocusChanged(bool focused) {
     if (windowFocused == focused)
         return;
+
+    /* Main thread. Pairs with the span in connection_terminated, which is on
+     * a detached thread: the two overlapping is the failure being chased. */
+    OtlpSpanScope otlpSpan(focused ? "applet.focus_gained"
+                                   : "applet.focus_lost");
 
     windowFocused = focused;
     Logger::info("StreamingView: window focus {}",

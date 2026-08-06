@@ -39,6 +39,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 #include "views/boolean_slider_cell.hpp"
 #include "OtlpLogExporter.hpp"
 #include "StdoutCapture.hpp"
+#include "OtlpTraceExporter.hpp"
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
@@ -239,6 +240,20 @@ int main(int argc, char* argv[]) {
     if (OtlpLogExporter::instance().start(home)) {
         brls::Logger::info("OTLP log export enabled, endpoint {}",
                            OtlpLogExporter::instance().endpoint());
+    }
+
+    // Spans, for the questions logs cannot answer: what overlapped what, on
+    // which thread, for how long. Reads the same otel-endpoint and posts to
+    // /v1/traces. Also journals each completed span to spans.jsonl as it
+    // finishes, because the failure being chased takes the whole console down
+    // and nothing buffered for the network survives that.
+    if (OtlpTraceExporter::instance().start(home)) {
+        brls::Logger::info("OTLP trace export enabled, endpoint {}",
+                           OtlpTraceExporter::instance().endpoint());
+        // One trace per app run. Spans default to hanging off this, so work
+        // on the detached termination thread and work on the main thread end
+        // up correlated instead of in two unrelated traces.
+        OtlpTraceExporter::instance().beginSession("moonlight.session");
     }
 
     // Everything printf writes, which is the part nxlink shows and the log

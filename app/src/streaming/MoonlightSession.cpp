@@ -1,4 +1,5 @@
 #include "MoonlightSession.hpp"
+#include "OtlpTraceExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "GameStreamClient.hpp"
 #include "InputManager.hpp"
@@ -89,6 +90,14 @@ void MoonlightSession::connection_started() {
 }
 
 void MoonlightSession::connection_terminated(int error_code) {
+    /* This runs on a detached thread that moonlight-common-c spawns, which is
+     * the whole reason it is worth a span. When it overlaps the main thread
+     * resuming the app, a log gives two lines 3ms apart and no way to tell
+     * whether they overlapped. The span hangs off the session root so both
+     * land in one trace and the overlap is visible rather than inferred. */
+    OtlpSpanScope otlpSpan("session.connection_terminated");
+    otlpSpan.attr("error.code", std::to_string(error_code));
+
     brls::Logger::info("MoonlightSession: Connection terminated with code: {}", error_code);
 
     if (!m_active_session)
@@ -102,6 +111,7 @@ void MoonlightSession::connection_terminated(int error_code) {
     }
 
     if (error_code != 0) {
+        otlpSpan.attr("outcome", "reconnect_attempt");
         brls::Logger::info("MoonlightSession: Reconnection attempt");
 
         // Connection is already terminated here; avoid toggling the user stop flag.

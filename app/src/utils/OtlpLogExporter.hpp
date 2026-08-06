@@ -139,7 +139,10 @@ class OtlpLogExporter {
     void onLogLine(brls::Logger::TimePoint when, brls::LogLevel level,
                    const std::string& line);
     void worker();
-    bool post(const std::string& body);
+    /* @url so the same transport carries logs and spans: they go to
+     * different OTLP signal paths but share the endpoint, headers and CA
+     * bundle, and there is no reason to stand up a second curl for it. */
+    bool post(const std::string& url, const std::string& body);
     [[nodiscard]] std::string buildPayload(const std::deque<Record>& batch) const;
 
     bool m_enabled = false;
