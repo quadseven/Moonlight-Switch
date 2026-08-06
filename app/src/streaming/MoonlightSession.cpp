@@ -141,7 +141,12 @@ void MoonlightSession::connection_terminated(int error_code) {
         // them was.
         {
             OtlpSpanScope stopSpan("session.LiStopConnection", &otlpSpan.span());
-            LiStopConnection();
+            /* Any value above 1 here is the two-thread teardown, directly. */
+            otlp_metric_count_add("moonlight.listop_inflight", 1);
+            otlp_metric_count_add("moonlight.listop_inflight", 1);
+    LiStopConnection();
+    otlp_metric_count_add("moonlight.listop_inflight", -1);
+            otlp_metric_count_add("moonlight.listop_inflight", -1);
         }
 
         OtlpSpanScope restartSpan("session.restart", &otlpSpan.span());
@@ -488,10 +493,25 @@ void MoonlightSession::draw(NVGcontext* vg, int width, int height) {
             m_video_renderer->invalidateHardwareResources();
         }
 
-        AVFrameHolder::instance().get(
-            [this, vg, width, height](AVFrame* frame) {
-                m_video_renderer->draw(vg, width, height, frame, m_video_format);
-            });
+        /* AVFrameHolder::get pops under the queue mutex and then releases it
+           before calling this, so the frame is used with nothing holding it.
+           If the decoder is being torn down on another thread at the same
+           moment, av_frame_free has already run and this hands a freed
+           AVFrame's nvmap handle to the GPU. That is the one candidate that
+           explains a death with no crash report, because the graphics service
+           kills the process from outside.
+
+           frames_in_flight is the test: if it is ever non zero while
+           decoder.cleanup is open, the two really do overlap. */
+        otlp_metric_count_add("moonlight.frames_in_flight", 1);
+        {
+            OtlpSpanScope frameSpan("render.draw_frame");
+            AVFrameHolder::instance().get(
+                [this, vg, width, height](AVFrame* frame) {
+                    m_video_renderer->draw(vg, width, height, frame, m_video_format);
+                });
+        }
+        otlp_metric_count_add("moonlight.frames_in_flight", -1);
 
         const uint64_t now = LiGetMillis();
         if (m_last_stats_update_ms == 0 || now - m_last_stats_update_ms >= 250) {

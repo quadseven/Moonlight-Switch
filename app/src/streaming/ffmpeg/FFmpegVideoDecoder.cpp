@@ -1,4 +1,6 @@
 #include "FFmpegVideoDecoder.hpp"
+#include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "FFmpegVideoDecoderPlatformHelpers.hpp"
 #include "Settings.hpp"
@@ -390,6 +392,8 @@ int FFmpegVideoDecoder::prepare_android_h264_extradata(PDECODE_UNIT decode_unit)
 
 int FFmpegVideoDecoder::setup(int video_format, int width, int height,
                               int redraw_rate, void* context, int dr_flags) {
+    otlp_metric_count_add("moonlight.decoder_alive", 1);
+
     m_stream_fps = redraw_rate;
 #if defined(PLATFORM_ANDROID)
     ffmpeg::decoder::cleanupAndroidMediaCodecState(m_android_mediacodec);
@@ -632,6 +636,13 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 }
 
 void FFmpegVideoDecoder::cleanup() {
+    /* Driven synchronously by LiStopConnection, which the reconnect path
+       calls on the termination thread. If this ever overlaps
+       render.draw_frame in a trace, the renderer is using a frame this
+       function is freeing. */
+    OtlpSpanScope otlpSpan("decoder.cleanup");
+    otlp_metric_count_add("moonlight.decoder_alive", -1);
+
     brls::Logger::info("FFmpeg: Cleanup...");
 
     m_decoder_ready = false;
