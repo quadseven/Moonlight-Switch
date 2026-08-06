@@ -12,6 +12,7 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include <unistd.h>   /* fsync: fflush reaches the fs sysmodule, only this reaches the card */
 #endif
 
 namespace {
@@ -190,10 +191,49 @@ void appendStringAttr(std::string& out, const std::string& k,
     out += "\"}}";
 }
 
-void journalSpan(const FinishedSpan& f) {
+/*
+ * Guards the journal FILE* only.
+ *
+ * Deliberately not g_mutex. Writing a span used to happen while holding the one
+ * lock that also guards begin(), sessionRoot(), stats() and takePayload(), so
+ * an SD write on the teardown thread stalled every other thread that touched a
+ * span, including the render thread during the decoder.cleanup window. That is
+ * the window under investigation, and the measurement was extending it: frame
+ * durations read off the trace included time spent blocked on another thread's
+ * card write, in the direction that makes the overlap look worse than it is.
+ */
+std::mutex g_journalMutex;
+/* Latched on the first failed write. A full or read-only card otherwise makes
+ * the journal silently stop growing, and a journal that stops is read as a
+ * process that stopped, which turns lost evidence into a wrong diagnosis. */
+bool g_journalWriteFailed = false;
+
+void writeJournalLine(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_journalMutex);
     if (!g_journal) {
         return;
     }
+    if (std::fwrite(line.data(), 1, line.size(), g_journal) != line.size()) {
+        g_journalWriteFailed = true;
+        return;
+    }
+    /* fflush pushes stdio's buffer into the fs sysmodule. It does NOT commit
+     * to the card: only fsync does, which reaches fsFileFlush through fsdev.
+     * The distinction is invisible until the case this file exists for, a hang
+     * followed by a hard power off, where the uncommitted tail is exactly the
+     * part describing the hang. */
+    if (std::fflush(g_journal) != 0) {
+        g_journalWriteFailed = true;
+        return;
+    }
+#ifdef __SWITCH__
+    if (fsync(fileno(g_journal)) != 0) {
+        g_journalWriteFailed = true;
+    }
+#endif
+}
+
+std::string formatSpanLine(const FinishedSpan& f) {
     std::string line = "{\"name\":\"";
     appendEscaped(line, f.name);
     line += "\",\"start\":";
@@ -226,11 +266,7 @@ void journalSpan(const FinishedSpan& f) {
         line += "\"";
     }
     line += "}\n";
-
-    std::fwrite(line.data(), 1, line.size(), g_journal);
-    /* The whole point. Without this the tail of the trace sits in a stdio
-     * buffer and dies with the console. */
-    std::fflush(g_journal);
+    return line;
 }
 
 }  // namespace
@@ -286,8 +322,7 @@ void otlp_trace_mark(const char* name) {
      * lets it be read off the card with no working network at any point. */
     line += otlp_metrics_snapshot();
     line += "}\n";
-    std::fwrite(line.data(), 1, line.size(), g_journal);
-    std::fflush(g_journal);
+    writeJournalLine(line);
 }
 
 OtlpTraceExporter& OtlpTraceExporter::instance() {
@@ -430,6 +465,7 @@ void OtlpTraceExporter::openJournal(const std::string& workingDir) {
         std::fwrite(line.data(), 1, line.size(), g_journal);
         std::fflush(g_journal);
     }
+    g_journalWriteFailed = false;
 }
 
 void OtlpTraceExporter::stop() {
@@ -539,14 +575,20 @@ void OtlpTraceExporter::end(
     f.name = name ? name : "span";
     f.attrs = attrs;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_spans.size() >= kMaxBufferedSpans) {
-        g_spans.pop_front();
-        g_dropped++;
+    /* Formatted before the lock and written after it. Only the buffer needs
+     * g_mutex; the card write does not, and holding it across an SD flush
+     * stalled every other thread that touches a span. */
+    const std::string line = formatSpanLine(f);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_spans.size() >= kMaxBufferedSpans) {
+            g_spans.pop_front();
+            g_dropped++;
+        }
+        g_spans.push_back(std::move(f));
+        g_ended++;
     }
-    journalSpan(f);
-    g_spans.push_back(std::move(f));
-    g_ended++;
+    writeJournalLine(line);
 }
 
 void OtlpTraceExporter::endError(
@@ -568,14 +610,20 @@ void OtlpTraceExporter::endError(
     f.error = message;
     f.attrs = attrs;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_spans.size() >= kMaxBufferedSpans) {
-        g_spans.pop_front();
-        g_dropped++;
+    /* Formatted before the lock and written after it. Only the buffer needs
+     * g_mutex; the card write does not, and holding it across an SD flush
+     * stalled every other thread that touches a span. */
+    const std::string line = formatSpanLine(f);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_spans.size() >= kMaxBufferedSpans) {
+            g_spans.pop_front();
+            g_dropped++;
+        }
+        g_spans.push_back(std::move(f));
+        g_ended++;
     }
-    journalSpan(f);
-    g_spans.push_back(std::move(f));
-    g_ended++;
+    writeJournalLine(line);
 }
 
 std::string OtlpTraceExporter::takePayload() {
@@ -641,6 +689,11 @@ std::string OtlpTraceExporter::takePayload() {
 
     out += "]}]}]}";
     return out;
+}
+
+bool OtlpTraceExporter::journalWriteFailed() const {
+    std::lock_guard<std::mutex> lock(g_journalMutex);
+    return g_journalWriteFailed;
 }
 
 OtlpTraceExporter::Stats OtlpTraceExporter::stats() const {

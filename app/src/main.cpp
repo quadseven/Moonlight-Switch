@@ -412,9 +412,11 @@ int main(int argc, char* argv[]) {
         // empty. Saying how many were produced next to how many POSTs were
         // refused separates "nothing happened" from "nothing arrived".
         const auto traceStats = OtlpTraceExporter::instance().stats();
-        brls::Logger::info("OTLP traces: started={} ended={} droppedOverflow={}",
+        brls::Logger::info("OTLP traces: started={} ended={} droppedOverflow={} "
+                           "journalWriteFailed={}",
                            traceStats.started, traceStats.ended,
-                           traceStats.droppedOverflow);
+                           traceStats.droppedOverflow,
+                           OtlpTraceExporter::instance().journalWriteFailed());
         const std::string lastError = OtlpLogExporter::instance().lastError();
         if (!lastError.empty()) {
             brls::Logger::error("OTLP: last transport error: {}", lastError);

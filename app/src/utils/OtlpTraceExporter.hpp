@@ -142,6 +142,15 @@ class OtlpTraceExporter {
     };
     [[nodiscard]] Stats stats() const;
 
+    /**
+     * Whether any journal write has failed since the run began.
+     *
+     * A full or read-only card makes the journal stop growing silently, and a
+     * journal that stops is read as a process that stopped. That turns lost
+     * evidence into a confident wrong answer, which is worse than losing it.
+     */
+    [[nodiscard]] bool journalWriteFailed() const;
+
   private:
     OtlpTraceExporter() = default;
 
