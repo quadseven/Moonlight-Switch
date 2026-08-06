@@ -131,6 +131,12 @@ class OtlpLogExporter {
         // so the two can be told apart in a query. Worth distinguishing:
         // borealis lines carry a real severity and these do not.
         std::string source;
+        // Which thread emitted the line. Without it, two events milliseconds
+        // apart cannot be told apart from one thread doing two things and two
+        // threads racing, which is usually the entire question. The spans
+        // carry the same attribute, so a log line and a span from the same
+        // moment can be joined on it.
+        uint64_t threadId;
     };
 
     /** Shared tail of onLogLine and logRaw: bounded push plus stats. */

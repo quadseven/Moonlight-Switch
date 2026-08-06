@@ -7,6 +7,10 @@
 #include <fstream>
 
 #include <curl/curl.h>
+
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 #include <jansson.h>
 
 namespace {
@@ -41,6 +45,21 @@ constexpr long kPostTimeoutSeconds = 15;
  * generate the record that causes the next failure. Counters only, read by
  * the main thread.
  */
+
+/* No thread_local anywhere near this, for the reason documented above: a
+ * thread_local store faults on a thread spawned on this platform. A syscall
+ * per record is cheap and cannot go wrong the same way. */
+uint64_t currentThreadId() {
+#ifdef __SWITCH__
+    u64 tid = 0;
+    if (R_FAILED(svcGetThreadId(&tid, threadGetCurHandle()))) {
+        return 0;
+    }
+    return tid;
+#else
+    return 0;
+#endif
+}
 
 std::string trim(const std::string& value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -323,6 +342,7 @@ void OtlpLogExporter::onLogLine(brls::Logger::TimePoint when,
     record.severityNumber = severityNumber(level);
     record.severityText = severityText(level);
     record.body = line;
+    record.threadId = currentThreadId();
     enqueue(std::move(record));
 }
 
@@ -345,6 +365,7 @@ void OtlpLogExporter::logRaw(const std::string& line, bool fromStderr) {
     record.severityText = fromStderr ? "WARN" : "INFO";
     record.body = line;
     record.source = fromStderr ? "stderr" : "stdout";
+    record.threadId = currentThreadId();
     enqueue(std::move(record));
 }
 
@@ -502,12 +523,24 @@ OtlpLogExporter::buildPayload(const std::deque<Record>& batch) const {
         // Only raw writes carry a source. Emitting the attribute
         // unconditionally would put an empty string on every ordinary line
         // and cost payload size on the hottest path for nothing.
-        if (!record.source.empty()) {
+        if (!record.source.empty() || record.threadId) {
             json_t* recordAttributes = json_array();
             if (recordAttributes) {
-                if (json_t* entry =
-                        stringAttribute("log.source", record.source)) {
-                    json_array_append_new(recordAttributes, entry);
+                if (!record.source.empty()) {
+                    if (json_t* entry =
+                            stringAttribute("log.source", record.source)) {
+                        json_array_append_new(recordAttributes, entry);
+                    }
+                }
+                if (record.threadId) {
+                    // String, not a number: this is a u64 and JSON cannot
+                    // carry that range without losing the low bits.
+                    if (json_t* entry = stringAttribute(
+                            "thread.id", std::to_string(record.threadId))) {
+                        json_array_append_new(recordAttributes, entry);
+                    }
+                }
+                if (json_array_size(recordAttributes) > 0) {
                     json_object_set_new(logRecord, "attributes",
                                         recordAttributes);
                 } else {
