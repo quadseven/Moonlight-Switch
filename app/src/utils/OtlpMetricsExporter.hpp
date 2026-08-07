@@ -27,13 +27,25 @@
  * Design
  * ------
  * Deliberately small. A fixed table of named series, no allocation on the
- * update path, updated from any thread under one lock. Gauges report the last
- * value written; counters are cumulative and monotonic, which is what the
- * OTLP sum type wants and what makes a rate query work.
+ * update path, updated from any thread under one lock.
+ *
+ * Counters are exported as DELTA sums: each point is the change since the
+ * previous export, not a running total. Cumulative is the more usual choice
+ * and is what this reached for first; Datadog's OTLP intake rejects it
+ * outright, and the rejection is silent from in here, so nothing arrived for a
+ * whole evening before anyone noticed.
+ *
+ * Gauges report the last value written, AND a peak alongside it. The peak is
+ * not decoration. A gauge is sampled once per export and the interval is ten
+ * seconds, while the counts worth watching here are held for a hundred
+ * milliseconds or less, so an instantaneous read is zero almost every time it
+ * is taken. Reporting only that would answer "was there ever a collision" with
+ * a confident no.
  *
  * Sent to /v1/metrics by the log exporter's worker, for the same reason spans
  * are: that loop already knows not to touch the network while the console is
- * suspended.
+ * suspended. It is also the only way out, which is why otlp_metrics_snapshot()
+ * below exists to put these same numbers on the SD card.
  */
 class OtlpMetricsExporter {
   public:
@@ -52,7 +64,13 @@ class OtlpMetricsExporter {
      */
     void gauge(const char* name, int64_t value);
 
-    /** Adds to a cumulative counter. Use for things that only ever happen. */
+    /**
+     * Adds to a counter. Use for things that only ever happen, never unhappen.
+     *
+     * The running total is kept here; what leaves is the change since the last
+     * export, because that is the only temporality the intake accepts. Callers
+     * do not need to care, and should not: pass what happened, not a total.
+     */
     void add(const char* name, int64_t delta);
 
     /** Convenience for the common case of counting one occurrence. */
