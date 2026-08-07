@@ -1,4 +1,6 @@
 #include "FFmpegVideoDecoder.hpp"
+#include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "FFmpegVideoDecoderPlatformHelpers.hpp"
 #include "Settings.hpp"
@@ -390,6 +392,8 @@ int FFmpegVideoDecoder::prepare_android_h264_extradata(PDECODE_UNIT decode_unit)
 
 int FFmpegVideoDecoder::setup(int video_format, int width, int height,
                               int redraw_rate, void* context, int dr_flags) {
+    otlp_metric_count_add("moonlight.decoder_alive", 1);
+
     m_stream_fps = redraw_rate;
 #if defined(PLATFORM_ANDROID)
     ffmpeg::decoder::cleanupAndroidMediaCodecState(m_android_mediacodec);
@@ -632,6 +636,18 @@ int FFmpegVideoDecoder::setup(int video_format, int width, int height,
 }
 
 void FFmpegVideoDecoder::cleanup() {
+    /* Driven synchronously by LiStopConnection, which the reconnect path
+       calls on the termination thread. If this ever overlaps
+       render.draw_frame in a trace, the renderer is using a frame this
+       function is freeing. */
+    OtlpSpanScope otlpSpan("decoder.cleanup");
+    /* Turns on per-frame span recording for as long as this teardown runs. A
+     * frame drawn while nothing is being freed answers nothing, so recording
+     * every frame all session would cost an SD flush per frame to bury the few
+     * that matter. These are those few. */
+    OtlpSpanWindow frameSpanWindow;
+    otlp_metric_count_add("moonlight.decoder_alive", -1);
+
     brls::Logger::info("FFmpeg: Cleanup...");
 
     m_decoder_ready = false;
@@ -840,8 +856,28 @@ int FFmpegVideoDecoder::submit_decode_unit(PDECODE_UNIT decode_unit) {
 
         }
         else {
+            /*
+             * A frame failed to decode, which is what a dying network produces,
+             * and the response is to restart the whole session from inside a
+             * moonlight-common-c video callback, on its decoder thread.
+             *
+             * This path left nothing behind. restart() carries a gauge, and
+             * gauges leave only over the network, on a worker that parks the
+             * moment focus is lost. Pull the network mid-stream and the journal
+             * shows connection_terminated closing normally and then silence,
+             * which is indistinguishable from being killed, and is the
+             * signature actually observed.
+             *
+             * Marks rather than a span, because restart() calls
+             * LiStopConnection, which tears down and joins the video decoder
+             * threads including the one running this. If it hangs there a span
+             * would never end and would write nothing; a mark is already on the
+             * card before the call is made.
+             */
+            otlp_trace_mark("decoder.restart.requested");
             if (MoonlightSession::activeSession() != nullptr)
                 MoonlightSession::activeSession()->restart();
+            otlp_trace_mark("decoder.restart.returned");
         }
     } else {
         brls::Logger::error("FFmpeg: Big buffer to decode... 2");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GameStreamClient.hpp"
+#include <atomic>
 #include "MoonlightSessionDecoderAndRenderProvider.hpp"
 #include <nanovg.h>
 
@@ -26,6 +27,13 @@ class MoonlightSession {
     void restart();
 
     void draw(NVGcontext* vg, int width, int height);
+
+    // Stops the session touching the GPU while the app is not on screen, and
+    // makes it drop any resource that may not have survived being off screen
+    // once it comes back. See StreamingView::onWindowFocusChanged().
+    void set_suspended(bool suspended);
+
+    bool is_suspended() const { return m_suspended; }
 
     bool is_active() const { return m_is_active; }
     bool is_terminated() const { return m_is_terminated; }
@@ -81,9 +89,16 @@ class MoonlightSession {
     IVideoRenderer* m_video_renderer = nullptr;
     IAudioRenderer* m_audio_renderer = nullptr;
 
-    bool m_is_active = false;
-    bool m_is_terminated = false;
-    bool m_stop_requested = false;
+    // Atomic because they cross threads: the connection-status callbacks
+    // arrive on moonlight-common-c's detached termination thread while the
+    // UI thread polls is_active()/is_terminated() every frame. As plain
+    // bools those concurrent accesses are a data race, which is undefined
+    // behaviour, not merely a stale read.
+    std::atomic<bool> m_is_active{false};
+    std::atomic<bool> m_is_terminated{false};
+    std::atomic<bool> m_stop_requested{false};
+    bool m_suspended = false;
+    bool m_invalidate_renderer_pending = false;
     bool m_connection_status_is_poor = false;
     bool m_use_hdr = false;
 

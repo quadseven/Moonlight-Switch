@@ -1034,8 +1034,9 @@ void DKVideoRenderer::updateFrameMapping(AVFrame* frame) {
         frameMappings.emplace_back(std::move(mapping));
         mappingIndex = static_cast<int>(frameMappings.size()) - 1;
 
-        brls::Logger::debug("{}: Added mapping for handle {}", __PRETTY_FUNCTION__,
-                            handle);
+        // DIAGNOSTIC BUILD: promoted to info so the handle set is visible at
+    // LOG_INFO. Low frequency, only fires on a cache miss.
+    brls::Logger::info("DKVideoRenderer: added mapping for handle {}", handle);
     }
 
     updateCmdMemRing.begin(updateCmdbuf);
@@ -1055,6 +1056,26 @@ void DKVideoRenderer::updateFrameMapping(AVFrame* frame) {
     }
 
     queue.submitCommands(updateCmdMemRing.end(updateCmdbuf));
+}
+
+void DKVideoRenderer::invalidateHardwareResources() {
+    if (!m_is_initialized) {
+        return;
+    }
+
+    // frameMappings wraps buffers owned by the NVTEGRA decoder pool, keyed by
+    // the nvmap handle and CPU address they had when they were mapped. A
+    // console sleep tears those services down, so after a resume an entry can
+    // still match by handle while no longer describing the memory the GPU
+    // would sample. Drop every mapping and let updateFrameMapping() rebuild
+    // the one the next frame actually needs, exactly as it does when the
+    // frame size changes.
+    queue.waitIdle();
+    const size_t droppedMappings = frameMappings.size();
+    frameMappings.clear();
+    currentMappingIndex = -1;
+    brls::Logger::info("DKVideoRenderer: dropped {} hardware frame mapping(s)",
+                       droppedMappings);
 }
 
 void DKVideoRenderer::releaseImageSlots() {

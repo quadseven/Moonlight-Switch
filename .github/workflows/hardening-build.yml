@@ -1,0 +1,52 @@
+name: Hardening build
+
+# all-builds only runs on master, so branch work has no Switch build without
+# this thin caller. Reuses the same docker build the release path uses.
+
+on:
+  push:
+    branches:
+      - fix/306-hardening
+      - feature/otel-debug-capture
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs before the Switch build, because it is the cheaper of the two and
+  # catches a different class of defect. The OTLP exporters keep their console
+  # calls behind #ifdef __SWITCH__, so on a plain toolchain they build against
+  # the standard library and can be exercised directly.
+  #
+  # Worth its own job because the alternative is the loop this replaces: build,
+  # copy to an SD card, stream until it crashes, carry the card back, read it.
+  # Hours per attempt, and a wrong guess destroys the evidence. Every exporter
+  # defect found so far was reachable from here, and two of them could not be
+  # seen on hardware at all, because a payload the backend refuses and an app
+  # nobody launched produce the same silence.
+  host-tests:
+    name: OTLP host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run
+        working-directory: tests/host
+        run: make run
+
+      # The exporters are driven from the main thread, a detached termination
+      # thread, brls::async workers and the render thread at once. A race
+      # between them on the console presents as the crash being investigated;
+      # here it presents as a stack trace.
+      - name: ThreadSanitizer
+        working-directory: tests/host
+        run: make tsan
+
+      - name: Address and UndefinedBehavior sanitizers
+        working-directory: tests/host
+        run: make asan
+
+  switch:
+    needs: host-tests
+    uses: ./.github/workflows/docker-image.yml

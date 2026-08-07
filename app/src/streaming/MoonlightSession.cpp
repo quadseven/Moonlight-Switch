@@ -1,4 +1,9 @@
 #include "MoonlightSession.hpp"
+
+#include <optional>
+
+#include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "GameStreamClient.hpp"
 #include "InputManager.hpp"
@@ -89,12 +94,33 @@ void MoonlightSession::connection_started() {
 }
 
 void MoonlightSession::connection_terminated(int error_code) {
+    /* Every arrival, including the repeats from multiple threads that show
+       up before a crash. The count is the signal; one is routine. */
+    OtlpMetricsExporter::instance().increment("moonlight.connection_terminated");
+
+    /* This runs on a detached thread that moonlight-common-c spawns, which is
+     * the whole reason it is worth a span. When it overlaps the main thread
+     * resuming the app, a log gives two lines 3ms apart and no way to tell
+     * whether they overlapped. The span hangs off the session root so both
+     * land in one trace and the overlap is visible rather than inferred. */
+    OtlpSpanScope otlpSpan("session.connection_terminated");
+    otlpSpan.attr("error.code", std::to_string(error_code));
+
     brls::Logger::info("MoonlightSession: Connection terminated with code: {}", error_code);
 
-    if (!m_active_session)
+    /* The invariant nobody can see from a log: is the static still pointing
+     * at a live session when the termination thread arrives. Recorded rather
+     * than only branched on, so a run where it was already gone is
+     * distinguishable from one where it was fine. */
+    OtlpMetricsExporter::instance().gauge("moonlight.active_session_present",
+                                          m_active_session ? 1 : 0);
+    if (!m_active_session) {
+        otlpSpan.attr("outcome", "no_active_session");
         return;
+    }
 
     if (m_active_session->m_stop_requested) {
+        otlpSpan.attr("outcome", "stop_acknowledged");
         brls::Logger::info("MoonlightSession: Termination acknowledged after stop request");
         m_active_session->m_is_active = false;
         m_active_session->m_is_terminated = true;
@@ -102,12 +128,51 @@ void MoonlightSession::connection_terminated(int error_code) {
     }
 
     if (error_code != 0) {
+        otlpSpan.attr("outcome", "reconnect_attempt");
+        /* Counts every reconnect the session attempts on its own. A rate on
+           this separates "the network blipped once" from the repeated
+           termination storm that precedes the hang. */
+        OtlpMetricsExporter::instance().increment("moonlight.reconnect_attempts");
         brls::Logger::info("MoonlightSession: Reconnection attempt");
 
         // Connection is already terminated here; avoid toggling the user stop flag.
-        LiStopConnection();
+        //
+        // Both of the calls below happen on the termination thread, and
+        // together they are the 100ms window the main thread was seen
+        // resuming inside. Split so the next crash says which half was
+        // running when the collision happened rather than only that one of
+        // them was.
+        {
+            OtlpSpanScope stopSpan("session.LiStopConnection", &otlpSpan.span());
+            /*
+             * Any value above 1 is two threads inside LiStopConnection at once,
+             * which is the defect itself rather than evidence of it.
+             *
+             * The count has to be taken at every call site or it cannot mean
+             * that. One thread entering here while another enters through
+             * stop() only reads as 2 if stop() is counted too; counting one
+             * site measures how often that site runs, which nothing needed.
+             *
+             * Scope guard rather than a matched pair of calls, so the release
+             * cannot be skipped by an early return and cannot be duplicated
+             * without the acquire being duplicated with it.
+             */
+            OtlpGaugeScope inflight("moonlight.listop_inflight");
+            LiStopConnection();
+        }
 
-        m_active_session->start([](const GSResult<bool>& result) {
+        OtlpSpanScope restartSpan("session.restart", &otlpSpan.span());
+
+        /* Read once. Every use below this point in the original code was a
+         * fresh load of a raw static that another thread can clear, so the
+         * pointer could differ between the null check and the call. */
+        MoonlightSession* session = m_active_session;
+        if (!session) {
+            restartSpan.fail("session cleared before restart");
+            return;
+        }
+
+        session->start([](const GSResult<bool>& result) {
             if (result.isSuccess()) {
                 brls::Logger::info("MoonlightSession: Reconnected");
             } else {
@@ -117,7 +182,7 @@ void MoonlightSession::connection_terminated(int error_code) {
                     m_active_session->m_is_terminated = true;
                 }
             }
-        }, m_active_session->m_is_sunshine);
+        }, session->m_is_sunshine);
         return;
     }
 
@@ -353,6 +418,12 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
                         &m_video_callbacks, &m_audio_callbacks, NULL, 0, NULL, 0);
 
                     if (result != 0) {
+                        /* Runs on a brls::async thread, so this is a fourth
+                         * way into LiStopConnection and has to be counted like
+                         * the others. A failed start cleaning itself up here
+                         * while the user backs out of the view is two threads
+                         * in the same teardown. */
+                        OtlpGaugeScope inflight("moonlight.listop_inflight");
                         LiStopConnection();
                         callback(
                             GSResult<bool>::failure("error/stream_start"_i18n));
@@ -370,6 +441,11 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
 }
 
 void MoonlightSession::stop(int terminate_app) {
+    /* Usually the main thread. If this ever overlaps
+     * session.connection_terminated in a trace, the object is being torn
+     * down while the termination thread is still inside it. */
+    OtlpSpanScope otlpSpan("session.stop");
+
     if (m_stop_requested)
         return;
 
@@ -379,10 +455,16 @@ void MoonlightSession::stop(int terminate_app) {
         GameStreamClient::instance().quit(m_address, [](auto _) {});
     }
 
+    /* The main thread's way in. This is the other half of the pair the count
+     * exists to catch: the guard above is m_stop_requested, and the reconnect
+     * path deliberately does not set it, so nothing here excludes a
+     * termination thread already inside LiStopConnection. */
+    OtlpGaugeScope inflight("moonlight.listop_inflight");
     LiStopConnection();
 }
 
 void MoonlightSession::restart() {
+    OtlpGaugeScope inflight("moonlight.listop_inflight");
     LiStopConnection();
 
     start([](const GSResult<bool>& result) {
@@ -398,12 +480,73 @@ void MoonlightSession::restart() {
     }, m_active_session->m_is_sunshine);
 }
 
+void MoonlightSession::set_suspended(bool suspended) {
+    if (m_suspended == suspended) {
+        return;
+    }
+
+    m_suspended = suspended;
+    // DIAGNOSTIC BUILD: report the session state across the transition. After
+    // a real sleep the wifi was off, so this is where a dead connection that
+    // nobody has declared terminated shows up as active=1 terminated=0 with
+    // no frames arriving.
+    brls::Logger::info("MoonlightSession: rendering {} (active={} terminated={} "
+                       "stop_requested={})",
+                       suspended ? "suspended" : "resumed", m_is_active.load(),
+                       m_is_terminated.load(), m_stop_requested.load());
+
+    if (!suspended) {
+        // The renderer is owned by the decoder callbacks and torn down on
+        // their thread, so let draw() do this from the render thread inside
+        // the guard it already holds rather than reaching for it here.
+        m_invalidate_renderer_pending = true;
+    }
+}
+
 void MoonlightSession::draw(NVGcontext* vg, int width, int height) {
+    // While the app is off screen the compositor is not showing our frames and
+    // the graphics service may be shutting down under us, so there is nothing
+    // to gain by drawing and a suspended GPU to fault by trying.
+    if (m_suspended) {
+        return;
+    }
+
     if (m_video_decoder && m_video_renderer) {
-        AVFrameHolder::instance().get(
-            [this, vg, width, height](AVFrame* frame) {
-                m_video_renderer->draw(vg, width, height, frame, m_video_format);
-            });
+        if (m_invalidate_renderer_pending) {
+            m_invalidate_renderer_pending = false;
+            m_video_renderer->invalidateHardwareResources();
+        }
+
+        /* AVFrameHolder::get pops under the queue mutex and then releases it
+           before calling this, so the frame is used with nothing holding it.
+           If the decoder is being torn down on another thread at the same
+           moment, av_frame_free has already run and this hands a freed
+           AVFrame's nvmap handle to the GPU. That is the one candidate that
+           explains a death with no crash report, because the graphics service
+           kills the process from outside.
+
+           frames_in_flight is the test: if it is ever non zero while
+           decoder.cleanup is open, the two really do overlap. */
+        /* The gauge is unconditional: an in-memory add with no I/O, and it is
+         * what makes frames_in_flight readable at any instant, including from
+         * inside decoder.cleanup. The span is not, because journalling one
+         * costs an SD card flush and this runs once per frame. Recording it
+         * all session would be sixty flushes a second to bury the handful that
+         * mean anything, and would slow the render path enough to move the
+         * timing being measured. decoder.cleanup opens the window; outside it
+         * this is an atomic load and nothing else. */
+        otlp_metric_count_add("moonlight.frames_in_flight", 1);
+        {
+            std::optional<OtlpSpanScope> frameSpan;
+            if (otlp_span_window_open()) {
+                frameSpan.emplace("render.draw_frame");
+            }
+            AVFrameHolder::instance().get(
+                [this, vg, width, height](AVFrame* frame) {
+                    m_video_renderer->draw(vg, width, height, frame, m_video_format);
+                });
+        }
+        otlp_metric_count_add("moonlight.frames_in_flight", -1);
 
         const uint64_t now = LiGetMillis();
         if (m_last_stats_update_ms == 0 || now - m_last_stats_update_ms >= 250) {

@@ -10,6 +10,8 @@
 #endif
 
 #include "streaming_view.hpp"
+#include "OtlpTraceExporter.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include "AVFrameHolder.hpp"
 #include "InputManager.hpp"
 #include "click_gesture_recognizer.hpp"
@@ -108,6 +110,15 @@ StreamingView::StreamingView(const Host& host, const AppInfo& app) : host(host),
                 }
             }, result.value().isSunshine());
         });
+
+    /* The invariant: exactly one focus subscription per live view. A
+       reviewer found this held five at once by opening and closing the
+       overlay and counting them in gdb. As a gauge it does not need finding. */
+    otlp_metric_count_add("moonlight.focus_subscriptions", 1);
+    otlp_metric_count_add("moonlight.streaming_views", 1);
+    windowFocusSubscription =
+        Application::getWindowFocusChangedEvent()->subscribe(
+            [this](bool focused) { this->onWindowFocusChanged(focused); });
 
     MoonlightInputManager::instance().reloadButtonMappingLayout();
 
@@ -284,8 +295,40 @@ void StreamingView::onFocusLost() {
         cancelDelay(bottombarDelayTask);
 }
 
+void StreamingView::onWindowFocusChanged(bool focused) {
+    if (windowFocused == focused)
+        return;
+
+    /* Main thread. Pairs with the span in connection_terminated, which is on
+     * a detached thread: the two overlapping is the failure being chased. */
+    OtlpSpanScope otlpSpan(focused ? "applet.focus_gained"
+                                   : "applet.focus_lost");
+
+    windowFocused = focused;
+    Logger::info("StreamingView: window focus {}",
+                 focused ? "gained" : "lost");
+
+    if (!focused) {
+        // On Switch this is the console going to sleep or the HOME menu
+        // taking over. Nothing we render is visible from here on, so stop
+        // the session before the graphics service goes away underneath it.
+        MoonlightInputManager::instance().dropInput();
+    }
+
+    session->set_suspended(!focused);
+}
+
 void StreamingView::draw(NVGcontext* vg, float x, float y, float width,
                          float height, Style style, FrameContext* ctx) {
+    if (!windowFocused) {
+        // Do not run the stream, the input handling or the overlays while the
+        // app is off screen. This has to come before the is_terminated()
+        // check: a session dropped by the console turning its wifi off for
+        // sleep must not tear activities down from under a compositor that is
+        // not running. The check below picks it up on the first frame back.
+        return;
+    }
+
     if (session->is_terminated()) {
         terminate(false);
         return;
@@ -585,11 +628,15 @@ void StreamingView::onLayout() {
 }
 
 StreamingView::~StreamingView() {
+    otlp_metric_count_add("moonlight.streaming_views", -1);
 #ifdef PLATFORM_TVOS
     updatePreferredDisplayMode(false);
 #endif
     
     Application::getPlatform()->disableScreenDimming(false);
+    Application::getWindowFocusChangedEvent()->unsubscribe(
+        windowFocusSubscription);
+    otlp_metric_count_add("moonlight.focus_subscriptions", -1);
     Application::getPlatform()
         ->getInputManager()
         ->getKeyboardKeyStateChanged()
