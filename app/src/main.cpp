@@ -416,6 +416,14 @@ int main(int argc, char* argv[]) {
     const bool otlpWasEnabled = OtlpLogExporter::instance().enabled();
     OtlpLogExporter::instance().stop();
 
+    // Also after stop(), not before: everything captured up to here had a
+    // running worker thread to reach. From here on printf/fprintf calls
+    // during the remainder of teardown -- moonlight-common-c, ffmpeg and
+    // libnx tearing down their own state -- fall through to the real
+    // console/nxlink device instead of being captured into an exporter that
+    // will never send them again. See StdoutCapture::stop().
+    StdoutCapture::stop();
+
     if (otlpWasEnabled) {
         const auto stats = OtlpLogExporter::instance().stats();
         brls::Logger::info("OTLP: accepted={} sent={} droppedFailed={} "

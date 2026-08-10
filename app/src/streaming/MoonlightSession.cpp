@@ -42,6 +42,31 @@ MoonlightSession::MoonlightSession(const std::string& address, int app_id) {
 }
 
 MoonlightSession::~MoonlightSession() {
+    /*
+     * Cleared first, not last. Every static callback above (video_decoder_*,
+     * audio_renderer_*, connection_terminated, ...) runs on threads this
+     * destructor does not control -- moonlight-common-c's detached
+     * termination thread chief among them -- and every one of them starts
+     * with the same guard: `if (m_active_session && m_active_session->...)`.
+     *
+     * With the old order, that guard was worthless for most of this
+     * function's body: m_active_session stayed non-null while the decoder,
+     * renderer and audio renderer were deleted one at a time, so a callback
+     * arriving in that window would pass the null check, read a
+     * m_video_decoder/m_video_renderer/m_audio_renderer pointer that had
+     * already been freed, and dereference it. That is a dangling window
+     * during shutdown, not a hypothetical one: it is exactly the shape of
+     * the crash this file's OTLP instrumentation exists to catch.
+     *
+     * Clearing the pointer before anything is deleted closes it: a callback
+     * that reads m_active_session from here on either sees nullptr and
+     * returns (every one of them already handles that) or it read the
+     * pointer before this line ran and is holding a session that is still
+     * fully intact, decoder and renderers included. There is no state left
+     * in between.
+     */
+    m_active_session = nullptr;
+
     if (m_video_decoder) {
         delete m_video_decoder;
     }
@@ -53,8 +78,6 @@ MoonlightSession::~MoonlightSession() {
     if (m_audio_renderer) {
         delete m_audio_renderer;
     }
-
-    m_active_session = nullptr;
 }
 
 // MARK: Connection callbacks
