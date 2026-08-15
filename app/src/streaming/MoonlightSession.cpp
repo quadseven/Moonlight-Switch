@@ -1,6 +1,7 @@
 #include "MoonlightSession.hpp"
 
 #include <fstream>
+#include <mutex>
 #include <optional>
 
 #include "OtlpTraceExporter.hpp"
@@ -19,6 +20,40 @@ extern void getWindowSize(int* w, int* h);
 using namespace brls;
 
 int m_video_format;
+
+/*
+ * Serialises every entry into LiStopConnection.
+ *
+ * File scope rather than a member, because LiStopConnection tears down
+ * moonlight-common-c's globals: there is one connection, so the exclusion has
+ * to be global too. Two MoonlightSession objects would not make two teardowns
+ * safe.
+ *
+ * Observed on 2026-08-15, having been predicted by the comment in stop() and
+ * by the listop_inflight gauge that exists for exactly this. The console woke,
+ * moonlight-common-c noticed its dead sockets 18ms BEFORE the applet focus
+ * event arrived, so the termination callback took the reconnect branch and
+ * entered LiStopConnection; the main thread then processed focus-gained,
+ * declined the resume, marked the session terminated and tore it down on top.
+ * Every teardown line in the log appears twice from that point:
+ *
+ *     17:40:40.767  Stopping audio stream..
+ *     17:40:40.780  Stopping audio stream..
+ *     17:40:40.773  Audren: Cleanup...
+ *     17:40:40.798  Audren: Cleanup...
+ *
+ * A mutex rather than a "already stopping, skip it" flag. Skipping would let
+ * the second caller return while the first is still inside, and it would then
+ * go on to delete the decoder and renderer that teardown is still using.
+ * Waiting costs the render thread a couple of hundred milliseconds once, which
+ * is nothing next to what it replaces. The second call then finds the stage
+ * already at STAGE_NONE and returns immediately.
+ *
+ * No deadlock risk: LiStopConnection joins moonlight-common-c's own threads,
+ * never the main or render thread, so a holder never waits on a waiter.
+ */
+static std::mutex g_stop_mutex;
+
 static MoonlightSession* m_active_session = nullptr;
 static MoonlightSessionDecoderAndRenderProvider* m_provider = nullptr;
 
@@ -174,6 +209,7 @@ void MoonlightSession::connection_terminated(int error_code) {
              * without the acquire being duplicated with it.
              */
             OtlpGaugeScope inflight("moonlight.listop_inflight");
+            std::lock_guard<std::mutex> stopLock(g_stop_mutex);
             LiStopConnection();
         }
 
@@ -546,6 +582,7 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
                          * while the user backs out of the view is two threads
                          * in the same teardown. */
                         OtlpGaugeScope inflight("moonlight.listop_inflight");
+                        std::lock_guard<std::mutex> stopLock(g_stop_mutex);
                         LiStopConnection();
                         callback(
                             GSResult<bool>::failure("error/stream_start"_i18n));
@@ -582,11 +619,13 @@ void MoonlightSession::stop(int terminate_app) {
      * path deliberately does not set it, so nothing here excludes a
      * termination thread already inside LiStopConnection. */
     OtlpGaugeScope inflight("moonlight.listop_inflight");
+    std::lock_guard<std::mutex> stopLock(g_stop_mutex);
     LiStopConnection();
 }
 
 void MoonlightSession::restart() {
     OtlpGaugeScope inflight("moonlight.listop_inflight");
+    std::lock_guard<std::mutex> stopLock(g_stop_mutex);
     LiStopConnection();
 
     start([](const GSResult<bool>& result) {
@@ -619,6 +658,31 @@ void MoonlightSession::set_suspended(bool suspended) {
 
     if (suspended) {
         m_suspended_at_ms.store(LiGetMillis(), std::memory_order_relaxed);
+
+        /*
+         * Decide on the way DOWN, not on the way up.
+         *
+         * The 2026-08-15 double teardown happened because this decision used
+         * to be made on resume, and the termination callback beat it there:
+         * moonlight-common-c saw its sockets die 18ms before the applet focus
+         * event arrived, read m_resume_declined as still false, and started
+         * reconnecting. The main thread then declined and tore down on top of
+         * it. Both were correct about their own state and the ordering was
+         * never guaranteed.
+         *
+         * With the default window of zero there is nothing to wait for: going
+         * off screen at all means this session will not be resumed, and that
+         * is knowable here. Setting it now means any termination callback
+         * arriving afterwards sees it, whatever order the events land in.
+         *
+         * A configured non-zero window still has to measure elapsed time, so
+         * it still decides on resume below. That path keeps the race, which is
+         * why it is opt-in and why the mutex around LiStopConnection exists
+         * regardless.
+         */
+        if (max_resumable_sleep_ms() == 0) {
+            m_resume_declined.store(true, std::memory_order_relaxed);
+        }
     } else {
         /*
          * Decide here whether this session is allowed to resume at all.
