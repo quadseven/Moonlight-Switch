@@ -1,5 +1,6 @@
 #include "MoonlightSession.hpp"
 
+#include <fstream>
 #include <optional>
 
 #include "OtlpTraceExporter.hpp"
@@ -134,8 +135,9 @@ void MoonlightSession::connection_terminated(int error_code) {
      * non-zero and that branch is precisely the one being avoided. */
     if (m_active_session->m_resume_declined.load(std::memory_order_relaxed)) {
         otlpSpan.attr("outcome", "resume_declined_after_sleep");
-        brls::Logger::info("MoonlightSession: not reconnecting, the sleep was "
-                           "longer than the resume window");
+        brls::Logger::info("MoonlightSession: not reconnecting after a "
+                           "suspend; every crash so far has come from that "
+                           "path. Relaunch from the app list.");
         m_active_session->m_is_active = false;
         m_active_session->m_is_terminated = true;
         return;
@@ -306,13 +308,47 @@ static constexpr uint64_t kFrameStallMs = 10000;
 /*
  * How long off screen before a resume is refused and the session starts clean.
  *
- * Thirty minutes, which is well clear of the reasons a stream is briefly
- * backgrounded (the HOME menu, a notification, putting the console down for a
- * moment) and well under the sleeps that broke it, which were fifteen and
- * twenty two hours. Under this, resume as before; the stall watchdog now covers
- * the case where that resume turns out to be a lie.
+ * ZERO. Every resume is refused.
+ *
+ * This started at thirty minutes on the theory that only long sleeps were
+ * dangerous. That theory is dead. Four occurrences, and the sleep before each
+ * was 15 hours, 2.5 minutes and 8.9 minutes; all three died within seconds of
+ * "MoonlightSession: Reconnected". Duration never predicted anything. The
+ * post-wake reconnect is the one constant, and it is the only code path that
+ * has ever killed this app.
+ *
+ * So the app stops using it. Losing focus ends the session, and coming back
+ * lands on the app list where relaunching is two button presses. That is a
+ * real cost and it is worth paying: the alternative on this hardware has been
+ * a frozen console needing the power button.
+ *
+ * This is avoidance, not a fix. The underlying ENOMEM is still open and every
+ * instrument added for it stays in place. What changes is that the console
+ * stops being unusable while that work continues.
+ *
+ * Overridable from the SD card without a rebuild: put a number of seconds in
+ * `switch/Moonlight-Switch/resume-after-sleep-seconds` to allow resuming across
+ * sleeps shorter than that. Absent or unparseable means never, which is the
+ * safe direction.
  */
-static constexpr uint64_t kMaxResumableSleepMs = 30 * 60 * 1000;
+static constexpr uint64_t kDefaultMaxResumableSleepMs = 0;
+
+static uint64_t max_resumable_sleep_ms() {
+    static uint64_t cached = []() -> uint64_t {
+        std::ifstream f(
+            "sdmc:/switch/Moonlight-Switch/resume-after-sleep-seconds");
+        long long seconds = 0;
+        if (f && (f >> seconds) && seconds > 0) {
+            brls::Logger::info(
+                "MoonlightSession: resume across sleeps up to {}s, from the "
+                "card. Default is never; this path has crashed every time.",
+                seconds);
+            return static_cast<uint64_t>(seconds) * 1000ULL;
+        }
+        return kDefaultMaxResumableSleepMs;
+    }();
+    return cached;
+}
 
 bool MoonlightSession::is_stalled() const {
     /* Only meaningful for a session that claims to be up. Anything already
@@ -610,16 +646,18 @@ void MoonlightSession::set_suspended(bool suspended) {
         if (since != 0) {
             const uint64_t now = LiGetMillis();
             const uint64_t asleep_ms = now > since ? now - since : 0;
-            if (asleep_ms >= kMaxResumableSleepMs) {
+            /* >= so that a threshold of zero refuses every resume, which is
+               the default and the whole point. */
+            if (asleep_ms >= max_resumable_sleep_ms()) {
                 m_resume_declined.store(true, std::memory_order_relaxed);
                 m_is_active = false;
                 m_is_terminated = true;
                 OtlpMetricsExporter::instance().increment(
                     "moonlight.resume_declined_after_sleep");
                 brls::Logger::warning(
-                    "MoonlightSession: asleep for {}s, longer than the {}s "
-                    "resume window, starting clean instead of resuming",
-                    asleep_ms / 1000, kMaxResumableSleepMs / 1000);
+                    "MoonlightSession: asleep for {}s, resume window is {}s, "
+                    "starting clean instead of resuming",
+                    asleep_ms / 1000, max_resumable_sleep_ms() / 1000);
             }
         }
         m_suspended_at_ms.store(0, std::memory_order_relaxed);
