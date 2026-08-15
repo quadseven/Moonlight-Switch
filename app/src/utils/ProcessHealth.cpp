@@ -1,6 +1,7 @@
 #include "ProcessHealth.hpp"
 
 #include "OtlpMetricsExporter.hpp"
+#include "ProcessThreads.hpp"
 
 #ifdef __SWITCH__
 #include <malloc.h>
@@ -40,6 +41,15 @@ ProcessHealthSample process_health_read() {
     sample.libraryThreads = LiGetActiveThreadCount();
 #endif
 
+    /* Outside the __SWITCH__ guard: these are our own atomics, maintained by
+     * the pthread_create wrapper, so they are just as correct on a host build
+     * and the host tests can exercise the publish path against real values. */
+    sample.processThreadsLive = process_threads_live();
+    sample.processThreadsStarted = process_threads_started();
+    sample.processThreadsFinished = process_threads_finished();
+    sample.threadCreateFailures = process_thread_create_failures();
+    sample.threadsLiveAtLastFailure = process_threads_live_at_last_failure();
+
     return sample;
 }
 
@@ -66,6 +76,20 @@ void process_health_publish(const ProcessHealthSample& sample) {
 
     if (sample.threadsValid) {
         metrics.gauge("moonlight.common_threads_active", sample.libraryThreads);
+    }
+
+    /* Unconditional: our own counters, no platform call to fail. */
+    metrics.gauge("moonlight.process_threads_live", sample.processThreadsLive);
+    metrics.gauge("moonlight.process_threads_started", sample.processThreadsStarted);
+    metrics.gauge("moonlight.process_threads_finished", sample.processThreadsFinished);
+    metrics.gauge("moonlight.thread_create_failures", sample.threadCreateFailures);
+
+    /* Only published once it means something. A -1 charted as a value would
+     * read as a real measurement of minus one thread; absence reads as "has
+     * not happened", which is the truth. */
+    if (sample.threadsLiveAtLastFailure >= 0) {
+        metrics.gauge("moonlight.threads_live_at_last_failure",
+                      sample.threadsLiveAtLastFailure);
     }
 }
 

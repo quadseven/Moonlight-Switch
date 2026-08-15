@@ -16,7 +16,8 @@
 
 SRC_DIR := ../../app/src/utils
 SOURCES := $(SRC_DIR)/OtlpTraceExporter.cpp $(SRC_DIR)/OtlpMetricsExporter.cpp \
-           $(SRC_DIR)/ProcessHealth.cpp
+           $(SRC_DIR)/ProcessHealth.cpp \
+           $(SRC_DIR)/ProcessThreads.cpp
 TEST    := test_otlp.cpp
 
 CXXFLAGS := -std=c++20 -I$(SRC_DIR) -Wall -Wextra -Wno-unused-parameter -g

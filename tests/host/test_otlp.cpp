@@ -22,6 +22,7 @@
 #include "OtlpTraceExporter.hpp"
 #include "OtlpMetricsExporter.hpp"
 #include "ProcessHealth.hpp"
+#include "ProcessThreads.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -33,8 +34,21 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <chrono>
+#include <pthread.h>
 #include <thread>
 #include <vector>
+
+/* The host link has no -Wl,--wrap, so the wrapper's __real_ symbol is
+ * undefined. Point it at the genuine pthread_create: the wrapper under test is
+ * then exercised for real, threads and all, rather than against a stub that
+ * cannot fail the way the console does. */
+extern "C" int __real_pthread_create(pthread_t* t, const pthread_attr_t* a,
+                                     void* (*e)(void*), void* arg) {
+    return pthread_create(t, a, e, arg);
+}
+extern "C" int __wrap_pthread_create(pthread_t*, const pthread_attr_t*,
+                                     void* (*)(void*), void*);
 
 namespace {
 
@@ -760,6 +774,94 @@ void testProcessHealthOmitsWhatItCannotRead() {
     mx.stop();
 }
 
+/*
+ * The pthread_create wrapper.
+ *
+ * This is the instrument built to answer the one question left open by the
+ * 2026-08-15 failure: pthread_create returned ENOMEM while the heap was at 2%
+ * and moonlight-common-c held 11 threads, so the exhausted resource is one
+ * nothing measured. The wrapper counts every thread in the process.
+ *
+ * An instrument that miscounts is worse than none, so it is counted here
+ * against threads that really run.
+ */
+void testThreadWrapperCounts() {
+    TEST("the pthread_create wrapper counts live threads accurately");
+
+    const int64_t startedBefore = process_threads_started();
+    const int64_t liveBefore = process_threads_live();
+
+    /* A thread that parks until released, so "live" can be observed while it
+     * genuinely is. Counting only after threads exit would pass against a
+     * wrapper that never incremented at all. */
+    static std::atomic<bool> release{false};
+    static std::atomic<int> running{0};
+    release = false;
+    running = 0;
+
+    auto body = [](void*) -> void* {
+        running.fetch_add(1);
+        while (!release.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return nullptr;
+    };
+
+    constexpr int N = 4;
+    pthread_t th[N];
+    for (int i = 0; i < N; i++) {
+        check(__wrap_pthread_create(&th[i], nullptr, body, nullptr) == 0,
+              "thread created through the wrapper");
+    }
+    while (running.load() < N) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    check(process_threads_started() == startedBefore + N,
+          "started count rose by exactly the number created");
+    check(process_threads_live() == liveBefore + N,
+          "live count rose while the threads are actually running");
+
+    release = true;
+    for (int i = 0; i < N; i++) pthread_join(th[i], nullptr);
+
+    /* Join returning does not by itself mean the trampoline has run its
+     * decrement, so settle rather than asserting on the first read. */
+    for (int i = 0; i < 200 && process_threads_live() != liveBefore; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    check(process_threads_live() == liveBefore,
+          "live count came back down once the threads returned");
+    check(process_threads_started() - process_threads_finished()
+              == process_threads_live(),
+          "started minus finished equals live, so the books balance");
+}
+
+/*
+ * The failure counters must stay at zero on a healthy run, or the gauge that is
+ * supposed to announce the bug would announce it constantly.
+ */
+void testThreadWrapperReportsNoFalseFailures() {
+    TEST("a healthy run records no thread-create failures");
+
+    check(process_thread_create_failures() == 0,
+          "no failures after creating and joining real threads");
+    check(process_threads_live_at_last_failure() == -1,
+          "the at-failure sample stays -1 until there has been a failure");
+
+    /* And -1 must not be published as if it were a measurement: a chart
+     * showing minus one live thread is worse than a gap. */
+    OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
+    mx.start(g_workDir);
+    process_health_publish(process_health_read());
+    const std::string payload = mx.takePayload();
+    check(contains(payload, "moonlight.process_threads_live"),
+          "the live count is published");
+    check(!contains(payload, "threads_live_at_last_failure"),
+          "the at-failure gauge is absent until it means something");
+    mx.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -782,6 +884,8 @@ int main() {
     testDisabledExporterIsInert();
     testProcessHealthGauges();
     testProcessHealthOmitsWhatItCannotRead();
+    testThreadWrapperCounts();
+    testThreadWrapperReportsNoFalseFailures();
 
     std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks
               << " checks passed\n";

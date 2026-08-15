@@ -47,8 +47,23 @@ struct ProcessHealthSample {
     bool threadsValid = false;
     /* Threads moonlight-common-c is holding. A count that does not return to
        its floor across a reconnect is a leak, visible long before the
-       allocation that finally fails. */
+       allocation that finally fails.
+
+       Measured 11 and flat through the 2026-08-15 failure, which is what ruled
+       a library thread leak out. The process-wide numbers below exist because
+       this one was too narrow to answer the question. */
     int64_t libraryThreads = 0;
+
+    /* Every thread in the process, counted by wrapping pthread_create at link
+       time. Always valid: these are our own counters, not a platform query
+       that can fail. */
+    int64_t processThreadsLive = 0;
+    int64_t processThreadsStarted = 0;
+    int64_t processThreadsFinished = 0;
+    int64_t threadCreateFailures = 0;
+    /* Live count captured inside the failing call, or -1 if it has never
+       failed. The single most valuable number in this struct. */
+    int64_t threadsLiveAtLastFailure = -1;
 };
 
 /** Reads the platform. Returns an all-invalid sample where it cannot. */

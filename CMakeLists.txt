@@ -649,6 +649,22 @@ else ()
         PNG::PNG)
 endif ()
 
+# Count every thread in the process, including the ones created inside static
+# archives this project does not compile: borealis, FFmpeg, libnx.
+#
+# On 2026-08-15 pthread_create returned ENOMEM with the heap at 2% of its
+# ceiling and moonlight-common-c holding 11 threads. Both were measured and both
+# were flat, so whatever ran out is something the existing gauges cannot see.
+# The process-wide thread count is the leading candidate and there is no libnx
+# API that reports it, so the count has to be built by interception.
+#
+# --wrap redirects references at link time, which is why it reaches code we
+# never compile. That is the whole point: the threads already visible are the
+# threads already exonerated. See app/src/utils/ProcessThreads.cpp.
+if(PLATFORM_SWITCH)
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=pthread_create)
+endif()
+
 # Recompiled CURL with Mbedtls support for Switch
 if(PLATFORM_SWITCH)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib/switch/libcurl.a)
