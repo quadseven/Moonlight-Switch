@@ -334,6 +334,29 @@ void StreamingView::draw(NVGcontext* vg, float x, float y, float width,
         return;
     }
 
+    /* The second, independent way to notice the stream is gone.
+     *
+     * is_terminated() above depends entirely on moonlight-common-c delivering
+     * its termination callback, and on 2026-08-14 it did not: the library
+     * failed to create the thread that callback runs on, having already set
+     * the flag that suppresses every later attempt. Nothing was ever told, so
+     * this function went on rendering the last decoded frame and queueing
+     * input nobody drained until the console was power cycled.
+     *
+     * Frames arriving is ground truth and cannot be suppressed by a flag, so a
+     * stall is reported once and torn down the same way a clean termination
+     * is. Logged rather than silent: the two paths reaching terminate() have
+     * very different causes and a log that cannot tell them apart is how the
+     * original defect stayed invisible for as long as it did. */
+    if (session->is_stalled()) {
+        OtlpMetricsExporter::instance().increment("moonlight.stream_stalls");
+        Logger::warning("StreamingView: no video for {}s while the session "
+                        "still reports active, tearing down",
+                        session->seconds_since_last_frame());
+        terminate(false);
+        return;
+    }
+
     session->draw(vg, (int) width, (int) height);
 
     if (!tempInputLock && session->is_active())

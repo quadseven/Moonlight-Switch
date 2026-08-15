@@ -38,6 +38,26 @@ class MoonlightSession {
     bool is_active() const { return m_is_active; }
     bool is_terminated() const { return m_is_terminated; }
 
+    /**
+     * True when the session says it is up but no video has arrived for long
+     * enough that it cannot be.
+     *
+     * is_terminated() is set by exactly one thing, the termination callback,
+     * and on 2026-08-14 that callback was never delivered: moonlight-common-c
+     * failed to create the thread it runs on, having already latched the flag
+     * that suppresses every later attempt. The session stayed active=1
+     * terminated=0 with a dead socket underneath it, so draw() kept rendering
+     * the last decoded frame and the console had to be power cycled.
+     *
+     * A second, independent way to notice removes that single point of failure.
+     * Frames arriving is the ground truth about whether a stream is alive, and
+     * unlike a callback it cannot be suppressed by a flag.
+     */
+    bool is_stalled() const;
+
+    /** Age of the newest frame, for the log line that reports a stall. */
+    uint64_t seconds_since_last_frame() const;
+
     bool connection_status_is_poor() const {
         return m_connection_status_is_poor;
     }
@@ -97,6 +117,21 @@ class MoonlightSession {
     std::atomic<bool> m_is_active{false};
     std::atomic<bool> m_is_terminated{false};
     std::atomic<bool> m_stop_requested{false};
+
+    // Written by the decoder thread on every frame, read by the render thread
+    // every frame. Atomic for the same reason the flags above are: concurrent
+    // access to a plain uint64_t here is a data race, not a stale read.
+    //
+    // Zero means no frame has arrived yet, which is a real state during
+    // connection setup and must not be read as a stall.
+    std::atomic<uint64_t> m_last_frame_ms{0};
+
+    // When the console went off screen, and whether the sleep that followed
+    // was too long to resume across. Written on the main thread by
+    // set_suspended(), read on the termination thread by
+    // connection_terminated(), so both are atomic.
+    std::atomic<uint64_t> m_suspended_at_ms{0};
+    std::atomic<bool> m_resume_declined{false};
     bool m_suspended = false;
     bool m_invalidate_renderer_pending = false;
     bool m_connection_status_is_poor = false;

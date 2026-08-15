@@ -74,7 +74,8 @@ if [ $# -gt 0 ]; then
 else
     FILES="app/src/utils/SwitchExceptionHandler.cpp \
            app/src/utils/OtlpTraceExporter.cpp \
-           app/src/utils/OtlpMetricsExporter.cpp"
+           app/src/utils/OtlpMetricsExporter.cpp \
+           app/src/utils/ProcessHealth.cpp"
 fi
 echo "checking: $FILES"
 echo
@@ -90,7 +91,12 @@ NM=$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm
 FLAGS="-std=gnu++20 -D__SWITCH__ -march=armv8-a+crc+crypto -mtune=cortex-a57 \
        -mtp=soft -ffunction-sections -fdata-sections \
        -isystem $DEVKITPRO/libnx/include -Iapp/src/utils \
+       -Iextern/moonlight-common-c/src \
        -Wall -Wextra -Wno-unused-parameter"
+
+# moonlight-common-c is on the include path for Limelight.h alone. It is a plain
+# C header over stdint and stdbool with no build of its own to configure, which
+# keeps ProcessHealth.cpp inside the rule above: libnx and the standard library.
 
 # -isystem, not -I: libnx headers trip -Wextra all by themselves and bury the
 # warnings that belong to our code, which is the only reason to run -Wextra.

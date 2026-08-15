@@ -1,6 +1,7 @@
 #include "OtlpLogExporter.hpp"
 #include "OtlpTraceExporter.hpp"
 #include "OtlpMetricsExporter.hpp"
+#include "ProcessHealth.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -455,6 +456,14 @@ void OtlpLogExporter::worker() {
          * drained: a gauge reports its current value every interval, so a
          * count that is wrong stays visible rather than appearing once. */
         if (OtlpMetricsExporter::instance().enabled()) {
+            /* Sampled here rather than on a timer of its own, immediately
+             * before the payload is taken, so the reading and the point it is
+             * attached to are the same instant. This loop is also already the
+             * one place that knows the console is awake, and reading the heap
+             * takes the allocator lock, which is not something to do on a
+             * suspended console just to publish a number nobody can receive. */
+            process_health_sample();
+
             const std::string m = OtlpMetricsExporter::instance().takePayload();
             if (!m.empty() &&
                 !post(OtlpMetricsExporter::instance().endpoint(), m)) {

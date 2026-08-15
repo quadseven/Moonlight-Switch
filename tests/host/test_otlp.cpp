@@ -21,6 +21,7 @@
 
 #include "OtlpTraceExporter.hpp"
 #include "OtlpMetricsExporter.hpp"
+#include "ProcessHealth.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -646,6 +647,119 @@ void testGaugesRideOnMarks() {
     mx.stop();
 }
 
+/*
+ * Process health gauges.
+ *
+ * On 2026-08-14 the app wedged the console after a fifteen hour sleep, and the
+ * first observable failure was pthread_create() returning ENOMEM. Nothing in
+ * the app measured memory, so forty hours of streaming produced no evidence of
+ * the trend and only one instant of the outcome.
+ *
+ * These fail against the code before ProcessHealth existed: there was no
+ * moonlight.heap_used_bytes series to find.
+ */
+void testProcessHealthGauges() {
+    TEST("process health publishes memory and thread gauges");
+
+    OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
+    mx.start(g_workDir);
+
+    ProcessHealthSample sample;
+    sample.heapValid = true;
+    sample.heapArenaBytes = 209715200;
+    sample.heapUsedBytes = 198000000;
+    sample.memValid = true;
+    sample.memUsedBytes = 320000000;
+    sample.memTotalBytes = 335544320;
+    sample.threadsValid = true;
+    sample.libraryThreads = 13;
+
+    process_health_publish(sample);
+    const std::string payload = mx.takePayload();
+
+    check(contains(payload, "moonlight.heap_arena_bytes"), "arena is published");
+    check(contains(payload, "moonlight.heap_used_bytes"), "heap used is published");
+    check(contains(payload, "moonlight.mem_used_bytes"), "process used is published");
+    check(contains(payload, "moonlight.mem_total_bytes"), "process total is published");
+    check(contains(payload, "moonlight.common_threads_active"),
+          "library thread count is published");
+    check(contains(payload, "\"asInt\":\"198000000\""), "heap used carries its value");
+    check(contains(payload, "\"asInt\":\"13\""), "thread count carries its value");
+
+    /* Free memory is deliberately not a series. The exporter keeps each gauge's
+     * peak, and for exhaustion the dangerous extreme is the most consumed; a
+     * free series would peak at the moment the most memory was available, which
+     * answers the opposite question. */
+    check(!contains(payload, "heap_free_bytes"),
+          "no free-memory series, whose peak would mean the opposite of the risk");
+
+    mx.stop();
+}
+
+/*
+ * A read that fails must not write anything, so the series holds its last real
+ * value rather than dropping to zero.
+ *
+ * Zero is the dangerous wrong answer here. A gauge repeats its current value
+ * every interval, so one failed read would not leave a gap in the chart, it
+ * would put a step down to the floor in the middle of it: heap_used falling to
+ * nothing looks exactly like the memory being released, which is the opposite
+ * of what a failing console is doing.
+ *
+ * Asserting on values rather than on the absence of a series name, because the
+ * series table is file scope and outlives any one exporter lifetime, so a name
+ * published by an earlier test is still present here.
+ */
+void testProcessHealthOmitsWhatItCannotRead() {
+    TEST("a failed read holds the last value instead of reporting zero");
+
+    OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
+    mx.start(g_workDir);
+
+    ProcessHealthSample good;
+    good.heapValid = true;
+    good.heapArenaBytes = 111000;
+    good.heapUsedBytes = 222000;
+    good.memValid = true;
+    good.memUsedBytes = 333000;
+    good.memTotalBytes = 444000;
+    good.threadsValid = true;
+    good.libraryThreads = 17;
+    process_health_publish(good);
+    mx.takePayload();
+
+    /* Exactly what process_health_read() returns off-console. */
+    process_health_publish(ProcessHealthSample{});
+    const std::string payload = mx.takePayload();
+
+    check(contains(payload, "\"asInt\":\"222000\""),
+          "heap used holds its last real value");
+    check(contains(payload, "\"asInt\":\"333000\""),
+          "process used holds its last real value");
+    check(contains(payload, "\"asInt\":\"17\""),
+          "thread count holds its last real value");
+    /* No blanket "nothing is zero" check: the payload carries every series in
+     * the table, and the ones unrelated to this test are legitimately zero.
+     * The three above are the assertion, since a series cannot report both its
+     * held value and a zero. */
+
+    /* Half a reading is still worth publishing: svcGetInfo failing is not a
+     * reason to stop charting the heap. */
+    ProcessHealthSample heapOnly;
+    heapOnly.heapValid = true;
+    heapOnly.heapArenaBytes = 555000;
+    heapOnly.heapUsedBytes = 666000;
+    process_health_publish(heapOnly);
+    const std::string partial = mx.takePayload();
+
+    check(contains(partial, "\"asInt\":\"666000\""),
+          "the readable half advances");
+    check(contains(partial, "\"asInt\":\"444000\""),
+          "the unreadable half is untouched, not zeroed");
+
+    mx.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -666,6 +780,8 @@ int main() {
     testGaugesRideOnMarks();
     testConcurrentUse();
     testDisabledExporterIsInert();
+    testProcessHealthGauges();
+    testProcessHealthOmitsWhatItCannotRead();
 
     std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks
               << " checks passed\n";

@@ -15,7 +15,8 @@
 # investigation. Here it presents as a stack trace, in about a second.
 
 SRC_DIR := ../../app/src/utils
-SOURCES := $(SRC_DIR)/OtlpTraceExporter.cpp $(SRC_DIR)/OtlpMetricsExporter.cpp
+SOURCES := $(SRC_DIR)/OtlpTraceExporter.cpp $(SRC_DIR)/OtlpMetricsExporter.cpp \
+           $(SRC_DIR)/ProcessHealth.cpp
 TEST    := test_otlp.cpp
 
 CXXFLAGS := -std=c++20 -I$(SRC_DIR) -Wall -Wextra -Wno-unused-parameter -g

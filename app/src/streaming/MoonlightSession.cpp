@@ -127,6 +127,20 @@ void MoonlightSession::connection_terminated(int error_code) {
         return;
     }
 
+    /* set_suspended() already ruled this session out: the console was away
+     * long enough that resuming is the path that hung it. This callback is the
+     * dead sockets being noticed, which is expected and needs no reconnect.
+     * Checked before the error_code branch below, because the code will be
+     * non-zero and that branch is precisely the one being avoided. */
+    if (m_active_session->m_resume_declined.load(std::memory_order_relaxed)) {
+        otlpSpan.attr("outcome", "resume_declined_after_sleep");
+        brls::Logger::info("MoonlightSession: not reconnecting, the sleep was "
+                           "longer than the resume window");
+        m_active_session->m_is_active = false;
+        m_active_session->m_is_terminated = true;
+        return;
+    }
+
     if (error_code != 0) {
         otlpSpan.attr("outcome", "reconnect_attempt");
         /* Counts every reconnect the session attempts on its own. A rate on
@@ -263,10 +277,71 @@ void MoonlightSession::video_decoder_cleanup() {
 int MoonlightSession::video_decoder_submit_decode_unit(
     PDECODE_UNIT decode_unit) {
     if (m_active_session && m_active_session->m_video_decoder) {
+        /* Stamped before the decode rather than after. What is being measured
+         * is whether the host is still sending, so a decoder that has begun
+         * taking a long time over a frame must not read as a dead stream. */
+        m_active_session->m_last_frame_ms.store(LiGetMillis(),
+                                                std::memory_order_relaxed);
         return m_active_session->m_video_decoder->submit_decode_unit(
             decode_unit);
     }
     return DR_OK;
+}
+
+/*
+ * How long without a frame counts as dead.
+ *
+ * Generous on purpose. A stream that is merely struggling still delivers
+ * something within a second or two, and connection_status_is_poor() already
+ * covers the degraded case with a warning rather than a teardown. This is the
+ * backstop for a stream that is gone and has no other way of saying so, and
+ * the cost of it firing early is ending a session the user was still watching.
+ *
+ * Ten seconds also sits clear of the longest legitimate gap observed on this
+ * console: a post-sleep reconnect took 1.7s to deliver its first audio packet
+ * and 600ms for video, and those happen with the timer reset anyway.
+ */
+static constexpr uint64_t kFrameStallMs = 10000;
+
+/*
+ * How long off screen before a resume is refused and the session starts clean.
+ *
+ * Thirty minutes, which is well clear of the reasons a stream is briefly
+ * backgrounded (the HOME menu, a notification, putting the console down for a
+ * moment) and well under the sleeps that broke it, which were fifteen and
+ * twenty two hours. Under this, resume as before; the stall watchdog now covers
+ * the case where that resume turns out to be a lie.
+ */
+static constexpr uint64_t kMaxResumableSleepMs = 30 * 60 * 1000;
+
+bool MoonlightSession::is_stalled() const {
+    /* Only meaningful for a session that claims to be up. Anything already
+     * terminated, stopping, or suspended has a better answer elsewhere, and a
+     * suspended console is not receiving frames by design. */
+    if (!m_is_active || m_is_terminated || m_stop_requested || m_suspended) {
+        return false;
+    }
+
+    const uint64_t last = m_last_frame_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        /* Connecting. No frame has arrived yet and none is overdue: the
+         * connection path has its own timeouts for the case where none ever
+         * does. Treating this as a stall would tear down every session during
+         * its own handshake. */
+        return false;
+    }
+
+    const uint64_t now = LiGetMillis();
+    return now > last && (now - last) >= kFrameStallMs;
+}
+
+uint64_t MoonlightSession::seconds_since_last_frame() const {
+    const uint64_t last = m_last_frame_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        return 0;
+    }
+    const uint64_t now = LiGetMillis();
+    return now > last ? (now - last) / 1000 : 0;
 }
 
 // MARK: Audio callbacks
@@ -313,6 +388,17 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
     m_is_sunshine = is_sunshine;
     m_stop_requested = false;
     m_is_terminated = false;
+    /* Cleared, not left to carry the previous session's last frame. A reconnect
+     * reuses this object, and inheriting a timestamp from before the outage
+     * would put the new session past the stall threshold before it has had a
+     * chance to deliver anything. */
+    m_last_frame_ms.store(0, std::memory_order_relaxed);
+    /* A declined resume applies to the session that was asleep, not to the
+     * clean connection being made in its place. Left set, the first
+     * termination on the new session would skip the reconnect that a normal
+     * network blip should get. */
+    m_resume_declined.store(false, std::memory_order_relaxed);
+    m_suspended_at_ms.store(0, std::memory_order_relaxed);
 
     LiInitializeStreamConfiguration(&m_config);
 
@@ -495,11 +581,62 @@ void MoonlightSession::set_suspended(bool suspended) {
                        suspended ? "suspended" : "resumed", m_is_active.load(),
                        m_is_terminated.load(), m_stop_requested.load());
 
+    if (suspended) {
+        m_suspended_at_ms.store(LiGetMillis(), std::memory_order_relaxed);
+    } else {
+        /*
+         * Decide here whether this session is allowed to resume at all.
+         *
+         * Of the two long sleeps recorded before the hang, the one that
+         * recovered was the one where the host refused: Sunshine answered "no
+         * running app to resume", the client gave up and made a fresh
+         * connection four seconds later, and the stream worked. The one that
+         * killed the console was the one where the host agreed. After fifteen
+         * hours it returned 200 with resume=1 for a session that was not really
+         * there, the client reported "Reconnected", and six hundred
+         * milliseconds later every socket was failing.
+         *
+         * So a resume that succeeds after a long sleep is the dangerous case,
+         * and it cannot be told apart from a good one by its response. Decline
+         * it on duration instead and start clean, which is the path that was
+         * already observed to work.
+         *
+         * The elapsed time is real. libnx's monotonic clock keeps counting
+         * while the console sleeps: the span journal from the failure has
+         * focus_lost to focus_gained at 53,773 seconds, which is exactly the
+         * 14h56m the console was actually away.
+         */
+        const uint64_t since = m_suspended_at_ms.load(std::memory_order_relaxed);
+        if (since != 0) {
+            const uint64_t now = LiGetMillis();
+            const uint64_t asleep_ms = now > since ? now - since : 0;
+            if (asleep_ms >= kMaxResumableSleepMs) {
+                m_resume_declined.store(true, std::memory_order_relaxed);
+                m_is_active = false;
+                m_is_terminated = true;
+                OtlpMetricsExporter::instance().increment(
+                    "moonlight.resume_declined_after_sleep");
+                brls::Logger::warning(
+                    "MoonlightSession: asleep for {}s, longer than the {}s "
+                    "resume window, starting clean instead of resuming",
+                    asleep_ms / 1000, kMaxResumableSleepMs / 1000);
+            }
+        }
+        m_suspended_at_ms.store(0, std::memory_order_relaxed);
+    }
+
     if (!suspended) {
         // The renderer is owned by the decoder callbacks and torn down on
         // their thread, so let draw() do this from the render thread inside
         // the guard it already holds rather than reaching for it here.
         m_invalidate_renderer_pending = true;
+
+        // No frames arrive while the console is asleep, so on the way back the
+        // last one is as old as the sleep was: fifteen hours, in the case this
+        // was written for. Restart the clock and give the resumed stream the
+        // full window to produce a frame. If it cannot, the stall fires then,
+        // on evidence, rather than immediately on arithmetic.
+        m_last_frame_ms.store(0, std::memory_order_relaxed);
     }
 }
 
