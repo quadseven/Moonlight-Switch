@@ -1,5 +1,7 @@
 #include "MoonlightSession.hpp"
 
+#include <vector>
+#include <cstdarg>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -243,14 +245,72 @@ void MoonlightSession::connection_terminated(int error_code) {
 }
 
 void MoonlightSession::connection_log_message(const char* format, ...) {
-    va_list arglist;
-    va_start(arglist, format);
-    int size = vsnprintf(NULL, 0, format, arglist);
-    char buffer[size];
-    vsnprintf(buffer, size, format, arglist);
-    va_end(arglist);
+    /*
+     * Every log line moonlight-common-c emits comes through here, and the
+     * version this replaces had three defects stacked on top of each other.
+     * 133 of the library's 263 Limelog call sites pass varargs, so this ran on
+     * roughly half of all library logging, including the whole teardown path.
+     *
+     * 1. THE VA_LIST WAS USED TWICE. vsnprintf consumes it, and passing the
+     *    same one to a second vsnprintf is undefined behaviour, not merely
+     *    sloppy. On AArch64 a va_list is a struct of pointers and offsets that
+     *    the first call advances; the second call then reads past the register
+     *    save area into whatever else is on the stack. A %s taking a garbage
+     *    pointer that happens to land in the code segment makes vsnprintf copy
+     *    machine code into the output, which is exactly what the tail of
+     *    log.log has contained on every crash since 2026-08-15:
+     *
+     *        14 20 82 d2   MOVZ x20, #0x1100
+     *        e0 ef 04 f9   STR  x0, [sp, ...]
+     *
+     *    va_copy is the whole fix and always was.
+     *
+     * 2. THE BUFFER WAS ONE BYTE SHORT. vsnprintf returns the length WITHOUT
+     *    the terminator, so `char buffer[size]` cannot hold the string and its
+     *    NUL. Every message silently lost its last character, which is why so
+     *    many library lines in the logs end without their newline.
+     *
+     * 3. size == 0 MADE IT WORSE. An empty result gives a zero length VLA,
+     *    vsnprintf(buffer, 0, ...) writes nothing at all, not even a NUL, and
+     *    then std::string(buffer) runs strlen over uninitialised stack until
+     *    it happens to find a zero byte. Unbounded read, arbitrary length
+     *    string, and a fault if it reaches an unmapped page.
+     *
+     * A fixed stack buffer for the common case, heap only when a message is
+     * genuinely long. Deliberately no allocation on the usual path: this is
+     * called from teardown, and teardown is where the heap has been found
+     * damaged, so the logger must not need a working allocator to report it.
+     */
+    va_list args;
+    va_start(args, format);
 
-    brls::Logger::info(fmt::runtime(std::string(buffer)));
+    va_list measure;
+    va_copy(measure, args);
+    const int needed = vsnprintf(nullptr, 0, format, measure);
+    va_end(measure);
+
+    if (needed < 0) {
+        va_end(args);
+        brls::Logger::error("MoonlightSession: unformattable log message");
+        return;
+    }
+
+    char stackBuffer[512];
+    const size_t length = static_cast<size_t>(needed);
+    char* out = stackBuffer;
+    std::vector<char> heapBuffer;
+    if (length + 1 > sizeof(stackBuffer)) {
+        heapBuffer.resize(length + 1);
+        out = heapBuffer.data();
+    }
+
+    vsnprintf(out, length + 1, format, args);
+    va_end(args);
+
+    /* Constructed with an explicit length rather than from a bare char*, so a
+     * message that somehow still is not terminated cannot send strlen off the
+     * end of the buffer. */
+    brls::Logger::info(fmt::runtime(std::string(out, length)));
 }
 
 void MoonlightSession::connection_rumble(unsigned short controller,
