@@ -17,6 +17,19 @@
  * before the fix. A test that passes both ways documents an opinion rather
  * than catching a defect. Where a test corresponds to a specific historical
  * bug, that bug is named.
+ *
+ * takePayload()/confirmDelivered()/commitPayload()
+ * -------------------------------------------------
+ * takePayload() on both exporters only renders. It no longer removes spans
+ * from the buffer or advances a counter's delta baseline / a gauge's peak
+ * -- see testFailedPostDoesNotLoseSpans and testFailedPostDoesNotLoseMetrics
+ * for why. confirmDelivered() (spans) and commitPayload() (metrics) are what
+ * actually retire what was just rendered, and stand in for a successful
+ * POST, so every test below that takes a payload and expects the buffer
+ * clear or the baseline advanced afterwards calls one of them immediately
+ * after taking it -- the same as a real caller would once its POST returns
+ * 200. Skipping that call is only correct in a test that is deliberately
+ * exercising what a failed POST leaves behind.
  */
 
 #include "OtlpTraceExporter.hpp"
@@ -143,6 +156,7 @@ void testNoDanglingParents() {
     }
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     check(!payload.empty(), "payload was produced");
 
     const std::vector<std::string> spanIds = fieldValues(payload, "spanId");
@@ -189,6 +203,7 @@ void testRealNestingIsPreserved() {
     tr.end(parent, "parent", {});
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     check(countOccurrences(payload, "\"parentSpanId\"") == 1,
           "exactly one span carries a parent (the child, not the top level)");
 
@@ -225,6 +240,7 @@ void testSessionSharesOneTraceId() {
     }
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     const std::vector<std::string> traceIds = fieldValues(payload, "traceId");
     check(traceIds.size() == 4, "four spans exported");
     const std::set<std::string> distinct(traceIds.begin(), traceIds.end());
@@ -252,6 +268,7 @@ void testCountersAreDelta() {
 
     mx.add("test.counter", 5);
     const std::string first = mx.takePayload();
+    mx.commitPayload();
     check(contains(first, "\"aggregationTemporality\":1"),
           "temporality is 1 (delta), not 2 (cumulative)");
     check(contains(first, "\"asInt\":\"5\""), "first interval reports 5");
@@ -260,6 +277,7 @@ void testCountersAreDelta() {
      * exporter reports 8 here; a delta exporter reports 3. */
     mx.add("test.counter", 3);
     const std::string second = mx.takePayload();
+    mx.commitPayload();
     check(contains(second, "\"asInt\":\"3\""),
           "second interval reports the delta 3, not the running total 8");
     check(!contains(second, "\"asInt\":\"8\""),
@@ -434,13 +452,20 @@ void testConcurrentUse() {
             }
         });
     }
-    /* A reader running alongside the writers, because takePayload swaps the
-     * buffer out from under threads that are still filling it. */
+    /* A reader running alongside the writers: takePayload copies the buffer
+     * out from under threads that are still filling it, and confirming each
+     * read drains it the same way a successful POST would, which is what
+     * keeps this loop exercising steady-state concurrent access under TSan
+     * instead of one growing snapshot. */
     std::thread reader([&] {
         while (!go.load()) { std::this_thread::yield(); }
         for (int i = 0; i < 50; i++) {
-            (void)tr.takePayload();
-            (void)mx.takePayload();
+            if (!tr.takePayload().empty()) {
+                tr.confirmDelivered();
+            }
+            if (!mx.takePayload().empty()) {
+                mx.commitPayload();
+            }
             std::this_thread::yield();
         }
     });
@@ -457,11 +482,16 @@ void testConcurrentUse() {
 
     /* Balanced scopes across every thread must land on zero. A non-zero value
      * here is the shape of the listop_inflight defect: an acquire without its
-     * release, or one taken twice. */
-    (void)mx.takePayload();
-    check(contains(mx.takePayload(), "\"asInt\":\"0\""),
+     * release, or one taken twice. This reads the gauge's live value, which
+     * is current-value reporting and unaffected by whether a prior payload
+     * was ever confirmed, but confirm anyway so nothing is left pending for
+     * whatever test runs next. */
+    const std::string finalPayload = mx.takePayload();
+    mx.commitPayload();
+    check(contains(finalPayload, "\"asInt\":\"0\""),
           "balanced scopes across 8 threads return the count to 0");
 
+    tr.confirmDelivered();
     tr.stop();
     mx.stop();
 }
@@ -483,6 +513,7 @@ void testPayloadEscaping() {
                 {{"attr\"key", "val\\ue"}});
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     check(contains(payload, "\\\""), "quotes are escaped");
     check(contains(payload, "\\\\"), "backslashes are escaped");
     check(contains(payload, "\\n"), "newlines are escaped");
@@ -517,6 +548,7 @@ void testTimestampsAreStringsAndPlausible() {
     tr.end(s, "timed", {});
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     check(contains(payload, "\"startTimeUnixNano\":\""),
           "startTimeUnixNano is a quoted string");
     check(contains(payload, "\"endTimeUnixNano\":\""),
@@ -564,8 +596,108 @@ void testDisabledExporterIsInert() {
           "a span ended after stop() is not recorded");
 
     const std::string payload = tr.takePayload();
+    tr.confirmDelivered();
     check(!contains(payload, "straddles.stop"),
           "a span ended after stop() is not exported");
+}
+
+/*
+ * The bug: takePayload() used to swap g_spans out and empty it in the same
+ * call that rendered the payload, before the caller had even tried to POST
+ * the string. A rejected POST -- a 502, same as any other transient
+ * failure -- then discarded every span in it for good, with nothing in any
+ * log to say so. Same shape as the RetroArch exporter's drop-on-failure,
+ * except that one is a documented, deliberate choice and this one was
+ * neither: it was a side effect of when the buffer happened to get cleared.
+ *
+ * The fix: takePayload() only renders. Spans stay in the buffer until
+ * confirmDelivered() retires exactly what was rendered, and that only runs
+ * after a POST actually succeeds.
+ */
+void testFailedPostDoesNotLoseSpans() {
+    TEST("an unconfirmed span renders again on retry instead of being lost "
+         "to a failed POST");
+
+    OtlpTraceExporter& tr = OtlpTraceExporter::instance();
+    tr.start(g_workDir);
+
+    OtlpTraceExporter::Span s = tr.begin("unconfirmed", nullptr);
+    tr.end(s, "unconfirmed", {});
+
+    /* Simulates a POST that failed: rendered, but never confirmed. */
+    const std::string firstAttempt = tr.takePayload();
+    check(contains(firstAttempt, "unconfirmed"),
+          "the span is in the first rendered payload");
+
+    /* A retry must render the identical span again. Against the pre-fix
+     * code, the first takePayload() already emptied g_spans by swapping it
+     * out, so this returns "" and the check below fails. */
+    const std::string retry = tr.takePayload();
+    check(contains(retry, "unconfirmed"),
+          "an unconfirmed payload renders the same span again on retry, "
+          "not an empty one");
+
+    /* A span that finishes while the (simulated) POST is in flight must
+     * survive confirming the earlier payload: confirmDelivered() may only
+     * retire what was actually rendered into `retry`, nothing added since. */
+    OtlpTraceExporter::Span s2 = tr.begin("arrived_during_retry", nullptr);
+    tr.end(s2, "arrived_during_retry", {});
+    tr.confirmDelivered();
+
+    const std::string afterConfirm = tr.takePayload();
+    check(!contains(afterConfirm, "unconfirmed"),
+          "confirming a delivered payload retires exactly what it rendered");
+    check(contains(afterConfirm, "arrived_during_retry"),
+          "a span that finished after the confirmed snapshot was taken is "
+          "not swept away with it");
+
+    tr.confirmDelivered();
+    tr.stop();
+}
+
+/*
+ * The bug: takePayload() used to advance a counter's exported baseline (and
+ * reset a gauge's peak) in the same call that rendered them, before the
+ * caller had tried to POST the string. A rejected POST then meant that delta
+ * was gone: the next export computed against the new baseline as if the
+ * failed one had shipped, exactly the "sent=0 evening" class of defect this
+ * exporter exists to make visible, except silent to itself.
+ */
+void testFailedPostDoesNotLoseMetrics() {
+    TEST("an uncommitted counter delta survives a takePayload() the way a "
+         "failed POST would leave it");
+
+    OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
+    mx.start(g_workDir);
+
+    mx.add("test.retry_counter", 4);
+    const std::string firstAttempt = mx.takePayload();
+    check(contains(firstAttempt, "\"asInt\":\"4\""),
+          "the delta of 4 is in the first rendered payload");
+
+    /* Simulated failed POST: no commitPayload() call. Against the pre-fix
+     * code, the first takePayload() already advanced the exported baseline
+     * to 4, so this renders a delta of 0 and the check below fails. */
+    const std::string retry = mx.takePayload();
+    check(contains(retry, "\"asInt\":\"4\""),
+          "an uncommitted payload renders the identical delta again, not "
+          "zero");
+
+    /* A delta that accrues while the (simulated) POST is in flight must not
+     * be swallowed by committing the earlier attempt: commitPayload() may
+     * only move the baseline to what `retry` actually rendered (4), not to
+     * whatever the live value has become since. */
+    mx.add("test.retry_counter", 2);
+    mx.commitPayload();
+
+    const std::string afterCommit = mx.takePayload();
+    check(contains(afterCommit, "\"asInt\":\"2\""),
+          "the delta that accrued during the retry is exported on its own");
+    check(!contains(afterCommit, "\"asInt\":\"6\""),
+          "the already-committed 4 is not counted again alongside it");
+
+    mx.commitPayload();
+    mx.stop();
 }
 
 /*
@@ -609,7 +741,8 @@ void testGaugesRideOnMarks() {
     OtlpMetricsExporter& mx = OtlpMetricsExporter::instance();
     tr.start(g_workDir);
     mx.start(g_workDir);
-    (void)mx.takePayload();  // reset the interval
+    (void)mx.takePayload();
+    mx.commitPayload();  // clear any pending baseline left by an earlier test
 
     /* A collision, opened and closed before anything could sample it. */
     {
@@ -633,12 +766,17 @@ void testGaugesRideOnMarks() {
     check(contains(payload, "test.mark_inflight.peak"),
           "the peak is exported as its own metric series");
     check(contains(payload, "\"asInt\":\"2\""), "carrying the value 2");
+    /* Confirms this exact payload as delivered, which is what actually
+     * resets the peak. Without it the peak of 2 would still be pending and
+     * would render again below, since nothing failed and nothing should be
+     * retried. */
+    mx.commitPayload();
 
     /* And after an export the peak restarts from the current value, not from
      * zero, or anything still held open across a flush would report a peak
      * below its own current value. */
-    (void)mx.takePayload();
     const std::string third = mx.takePayload();
+    mx.commitPayload();
     check(!contains(third, "\"asInt\":\"2\""),
           "the peak does not persist into later intervals");
 
@@ -662,6 +800,8 @@ int main() {
     testJournalRotates();
     testPayloadEscaping();
     testTimestampsAreStringsAndPlausible();
+    testFailedPostDoesNotLoseSpans();
+    testFailedPostDoesNotLoseMetrics();
     testSpanWindow();
     testGaugesRideOnMarks();
     testConcurrentUse();

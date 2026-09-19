@@ -129,8 +129,26 @@ class OtlpTraceExporter {
     void endError(const Span& span, const char* name, const std::string& message,
                   const std::vector<std::pair<std::string, std::string>>& attrs = {});
 
-    /** Drains buffered spans into an OTLP payload, or "" if none. */
+    /**
+     * Renders buffered spans into an OTLP payload, or "" if none.
+     *
+     * Does not remove them from the buffer. A span only leaves once
+     * confirmDelivered() is called for the payload it was rendered into, so
+     * a POST that fails leaves the spans in place to render again next time
+     * rather than discarding them. Call confirmDelivered() only after the
+     * POST for this exact payload has succeeded.
+     */
     [[nodiscard]] std::string takePayload();
+
+    /**
+     * Removes the spans included in the most recent takePayload() call.
+     *
+     * Call only after a successful POST of that payload. Spans that arrived
+     * after takePayload() was called (on other threads, while the POST was
+     * in flight) are left in place; they were never rendered, so this must
+     * not remove them.
+     */
+    void confirmDelivered();
 
     /** Resolved traces endpoint, for logging. Carries no credential. */
     [[nodiscard]] std::string endpoint() const { return m_endpoint; }

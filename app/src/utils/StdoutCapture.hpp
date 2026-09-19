@@ -40,11 +40,34 @@ namespace StdoutCapture {
  * a capture with nowhere to send is pointless, and after any
  * brls::Logger::setLogOutput, because this redirects that too.
  *
- * Not reversible. There is no uninstall: the devoptab entry has to outlive
- * every FILE that might still be flushed during shutdown, and swapping it
- * back while another thread is mid write is a worse problem than leaving it.
+ * The devoptab entry itself is never removed: it has to outlive every FILE
+ * that might still be flushed during shutdown, and swapping devoptab_list
+ * back while another thread is mid write is a real problem. See stop(),
+ * though -- that used to mean anything written after the exporter stopped
+ * was captured into a sink nothing was draining and lost, during exactly
+ * the teardown window this exists to make visible. It no longer does.
  */
 bool install(const std::string& workingDir);
+
+/**
+ * Stops routing captured writes to OTLP; from here on they pass straight
+ * through to whatever stdout/stderr pointed at before install() ran (the
+ * console, or an nxlink socket), the same as if the capture had never been
+ * installed.
+ *
+ * Call once OtlpLogExporter::stop() has returned, and before doing anything
+ * else that might printf during the remainder of the process's life. Safe to
+ * call even if install() never ran or never took: a no-op unless the capture
+ * is actually active.
+ *
+ * This only flips a flag the write path already checks; devoptab_list itself
+ * is never touched again, for the same reason install() only ever sets it
+ * once. The previous device saved by install() is invoked directly, so a
+ * line written during this remainder of teardown reaches the same place it
+ * would have without capture, instead of being buffered into an exporter
+ * that has already joined its worker thread and will never send it.
+ */
+void stop();
 
 /**
  * Whether the capture was asked for, without installing anything.

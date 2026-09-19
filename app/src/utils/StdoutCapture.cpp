@@ -1,5 +1,6 @@
 #include "StdoutCapture.hpp"
 
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -16,6 +17,20 @@ namespace {
 bool g_active = false;
 
 #ifdef __SWITCH__
+// Whether a captured write should still be routed to OTLP. True from
+// install() until stop() is called; stays true for the rest of the process
+// if stop() is never called at all, which is the normal case outside
+// teardown. Checked on every write, so this is the one piece of state that
+// has to be atomic: captureWrite/captureWriteErr run on whatever thread
+// printf'd, and stop() runs on the main thread during teardown.
+std::atomic<bool> g_forwarding{false};
+
+// What devoptab_list[STD_OUT]/[STD_ERR] pointed to before install()
+// overwrote them -- the console device, or nxlink's socket redirection if
+// nxlink set up first. Saved so stop() has somewhere real to fall through
+// to instead of a sink nobody drains: see the comment on captureWrite below.
+const devoptab_t* g_prevOutDevice = nullptr;
+const devoptab_t* g_prevErrDevice = nullptr;
 
 /*
  * Threading and re-entrancy
@@ -84,9 +99,21 @@ void drain(std::string& pending, const char* data, size_t len, bool isStderr) {
 }
 
 ssize_t captureWrite(struct _reent* r, void* fd, const char* ptr, size_t len) {
-    (void)r;
-    (void)fd;
     if (ptr == nullptr || len == 0) {
+        return static_cast<ssize_t>(len);
+    }
+    if (!g_forwarding.load(std::memory_order_relaxed)) {
+        // stop() has run. Route straight to whatever this slot pointed to
+        // before install() took it over -- the console, or nxlink -- instead
+        // of buffering into an exporter whose worker thread has already
+        // joined and will never send it. This is the fix for the capture
+        // silently swallowing the exact teardown window it exists to make
+        // visible: previously there was no such fallback, only the OTLP
+        // path, so anything written after OtlpLogExporter::stop() reached
+        // neither the network nor the screen.
+        if (g_prevOutDevice && g_prevOutDevice->write_r) {
+            return g_prevOutDevice->write_r(r, fd, ptr, len);
+        }
         return static_cast<ssize_t>(len);
     }
     {
@@ -100,9 +127,13 @@ ssize_t captureWrite(struct _reent* r, void* fd, const char* ptr, size_t len) {
 
 ssize_t captureWriteErr(struct _reent* r, void* fd, const char* ptr,
                         size_t len) {
-    (void)r;
-    (void)fd;
     if (ptr == nullptr || len == 0) {
+        return static_cast<ssize_t>(len);
+    }
+    if (!g_forwarding.load(std::memory_order_relaxed)) {
+        if (g_prevErrDevice && g_prevErrDevice->write_r) {
+            return g_prevErrDevice->write_r(r, fd, ptr, len);
+        }
         return static_cast<ssize_t>(len);
     }
     {
@@ -161,14 +192,28 @@ bool install(const std::string& workingDir) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
+    // Saved before being overwritten, so stop() has a real destination to
+    // fall through to instead of a dead exporter. This is what console.c's
+    // own dotab_stdout (or nxlink's redirection, if nxlink got here first)
+    // pointed at prior to this call.
+    g_prevOutDevice = devoptab_list[STD_OUT];
+    g_prevErrDevice = devoptab_list[STD_ERR];
+
     devoptab_list[STD_OUT] = &g_outDevice;
     devoptab_list[STD_ERR] = &g_errDevice;
 
+    g_forwarding = true;
     g_active = true;
     return true;
 #else
     (void)workingDir;
     return false;
+#endif
+}
+
+void stop() {
+#ifdef __SWITCH__
+    g_forwarding = false;
 #endif
 }
 

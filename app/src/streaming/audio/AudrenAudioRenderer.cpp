@@ -1,6 +1,7 @@
 #ifdef __SWITCH__
 
 #include "AudrenAudioRenderer.hpp"
+#include "OtlpMetricsExporter.hpp"
 #include <Settings.hpp>
 #include <borealis.hpp>
 #include <algorithm>
@@ -66,20 +67,31 @@ int AudrenAudioRenderer::init(int audio_configuration,
 
     if (!mempool_ptr) {
         brls::Logger::error("Audren: mempool alloc failed");
+        // m_decoder and m_decoded_buffer are already allocated above. Route
+        // the failure through cleanup() rather than returning directly, so
+        // whatever this init() attempt acquired before failing is released
+        // instead of leaking until the next successful init overwrites the
+        // pointers -- or until the object is destroyed, if it never gets
+        // that far.
+        cleanup();
         return -1;
     }
 
     Result rc = audrenInitialize(&m_ar_config);
     if (R_FAILED(rc)) {
         brls::Logger::error("Audren: audrenInitialize: %x", rc);
+        cleanup();
         return -1;
     }
+    m_audren_initialized = true;
 
     rc = audrvCreate(&m_driver, &m_ar_config, m_channel_count);
     if (R_FAILED(rc)) {
         brls::Logger::error("Audren: audrvCreate: %x", rc);
+        cleanup();
         return -1;
     }
+    m_driver_created = true;
 
     for (int i = 0; i < BUFFER_COUNT; i++) {
         m_wavebufs[i].data_raw = mempool_ptr;
@@ -116,6 +128,14 @@ int AudrenAudioRenderer::init(int audio_configuration,
 
     m_inited_driver = true;
 
+    // A live count, not a total: reads 1 while a stream's audio session is
+    // up and 0 once cleanup() has run, the same shape as
+    // moonlight.focus_subscriptions. A leaked audren session -- cleanup()
+    // never called, or called without a matching init -- shows up as this
+    // never coming back to 0 across a reconnect instead of needing gdb to
+    // find, which is how the last leak in this file was found.
+    OtlpMetricsExporter::instance().gauge("moonlight.audren_sessions", 1);
+
     brls::Logger::info("Audren: Init done!");
 
     return DR_OK;
@@ -123,6 +143,13 @@ int AudrenAudioRenderer::init(int audio_configuration,
 
 void AudrenAudioRenderer::cleanup() {
     brls::Logger::info("Audren: Cleanup...");
+
+    // Snapshotted before anything below clears it: this cleanup() call only
+    // represents a full teardown -- and only then should the session gauge
+    // drop back to 0 -- if init() actually reached the point of reporting
+    // one live. A cleanup() reached from a partial-init failure path did not
+    // increment the gauge, so it must not decrement it either.
+    const bool wasFullyInited = m_inited_driver;
 
     if (m_decoder) {
         opus_multistream_decoder_destroy(m_decoder);
@@ -139,11 +166,22 @@ void AudrenAudioRenderer::cleanup() {
         mempool_ptr = nullptr;
     }
 
-    if (m_inited_driver) {
-        m_inited_driver = false;
-        audrvVoiceStop(&m_driver, 0);
+    if (m_driver_created) {
+        if (m_inited_driver) {
+            audrvVoiceStop(&m_driver, 0);
+        }
         audrvClose(&m_driver);
+        m_driver_created = false;
+    }
+    m_inited_driver = false;
+
+    if (m_audren_initialized) {
         audrenExit();
+        m_audren_initialized = false;
+    }
+
+    if (wasFullyInited) {
+        OtlpMetricsExporter::instance().gauge("moonlight.audren_sessions", 0);
     }
 
     brls::Logger::info("Audren: Cleanup done!");

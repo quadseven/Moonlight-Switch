@@ -2,6 +2,7 @@
 
 #include "OtlpMetricsExporter.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -37,6 +38,11 @@ struct FinishedSpan {
 
 std::mutex g_mutex;
 std::deque<FinishedSpan> g_spans;
+/* How many entries at the front of g_spans were included in the payload
+ * takePayload() most recently rendered, and are still awaiting a call to
+ * confirmDelivered() before they may be erased. Zero when nothing is
+ * pending. Plain size_t, not atomic: only ever touched under g_mutex. */
+size_t g_pendingSentCount = 0;
 
 /* The session-wide root. Read from any thread, including the detached one
  * that delivers connection_terminated, so it is guarded by g_mutex rather
@@ -627,13 +633,22 @@ void OtlpTraceExporter::endError(
 }
 
 std::string OtlpTraceExporter::takePayload() {
-    std::deque<FinishedSpan> batch;
+    std::deque<FinishedSpan> snapshot;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_spans.empty()) {
+            g_pendingSentCount = 0;
             return "";
         }
-        batch.swap(g_spans);
+        /* Copy rather than swap. A swap used to empty g_spans right here, so
+         * a single failed POST discarded every span in the batch with no way
+         * to try again -- exactly the evidence a 502 during the crash under
+         * investigation would take with it. The count is recorded so
+         * confirmDelivered() removes exactly what got rendered into this
+         * payload, not whatever g_spans holds by the time the POST returns:
+         * other threads keep calling end()/endError() while curl runs. */
+        snapshot.assign(g_spans.begin(), g_spans.end());
+        g_pendingSentCount = snapshot.size();
     }
 
     std::string out;
@@ -645,7 +660,7 @@ std::string OtlpTraceExporter::takePayload() {
     out += "]},\"scopeSpans\":[{\"spans\":[";
 
     bool first = true;
-    for (const FinishedSpan& s : batch) {
+    for (const FinishedSpan& s : snapshot) {
         if (!first) {
             out += ",";
         }
@@ -689,6 +704,15 @@ std::string OtlpTraceExporter::takePayload() {
 
     out += "]}]}]}";
     return out;
+}
+
+void OtlpTraceExporter::confirmDelivered() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const size_t n = std::min(g_pendingSentCount, g_spans.size());
+    for (size_t i = 0; i < n; i++) {
+        g_spans.pop_front();
+    }
+    g_pendingSentCount = 0;
 }
 
 int OtlpTraceExporter::journalFd() const {

@@ -250,7 +250,17 @@ bool OtlpLogExporter::start(const std::string& workingDir) {
 
     m_subscription = brls::Logger::getLogEvent()->subscribe(
         [this](brls::Logger::TimePoint when, brls::LogLevel level,
-               const std::string& line) { this->onLogLine(when, level, line); });
+               const std::string& line) {
+            // Checked here, not just relied on elsewhere: once stop() has
+            // run there is nothing this should do, and the check has to
+            // happen before touching `this` for anything else, since a
+            // stopped exporter is exactly the state stop() leaves this
+            // object in for the remainder of the process.
+            if (!m_subscribed.load(std::memory_order_relaxed)) {
+                return;
+            }
+            this->onLogLine(when, level, line);
+        });
     m_subscribed = true;
 
     m_thread = std::thread([this] { this->worker(); });
@@ -281,10 +291,30 @@ void OtlpLogExporter::stop() {
         return;
     }
 
-    if (m_subscribed) {
-        brls::Logger::getLogEvent()->unsubscribe(m_subscription);
-        m_subscribed = false;
-    }
+    /*
+     * Deliberately does NOT call brls::Logger::getLogEvent()->unsubscribe()
+     * here anymore. brls::Event keeps its callbacks in a plain std::list
+     * with no lock of its own (extern/borealis/library/include/borealis/
+     * core/event.hpp): unsubscribe() erases an iterator from that list with
+     * nothing guarding it. brls::Logger::log() fires the same event while
+     * holding its own private logMtx (extern/borealis/.../core/logger.hpp),
+     * but logMtx is private to Logger -- there is no way to take the same
+     * lock from out here. Any thread logging at the moment stop() ran
+     * (the detached termination thread this exporter exists to diagnose is
+     * exactly such a thread) could be mid-iteration over that list while
+     * this erased out from under it: a teardown-time crash indistinguishable
+     * from the one under investigation, possibly caused by the tooling
+     * added to diagnose it.
+     *
+     * Instead the subscription is left in place for the rest of the
+     * process, and the lambda in start() checks m_subscribed before doing
+     * anything. onLogLine()/enqueue() stay safe to call after stop(): this
+     * is a process-lifetime singleton, m_mutex is still valid, and a record
+     * pushed after stop() just sits unread in a bounded buffer until the
+     * process exits, which costs nothing next to corrupting brls::Event's
+     * internal list.
+     */
+    m_subscribed = false;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -444,10 +474,19 @@ void OtlpLogExporter::worker() {
          * quiet stretch is exactly when a stream is running normally. */
         if (OtlpTraceExporter::instance().enabled()) {
             const std::string spans = OtlpTraceExporter::instance().takePayload();
-            if (!spans.empty() &&
-                !post(OtlpTraceExporter::instance().endpoint(), spans)) {
-                std::lock_guard<std::mutex> statsLock(m_statsMutex);
-                m_stats.tracePostFailures++;
+            if (!spans.empty()) {
+                /* takePayload() only renders; the spans stay buffered until
+                 * confirmDelivered() runs, and that only happens here, only
+                 * on success. A failed POST -- a 502, same as any other --
+                 * leaves them in place to render again next pass instead of
+                 * being discarded with the rest of the batch that never
+                 * shipped. */
+                if (post(OtlpTraceExporter::instance().endpoint(), spans)) {
+                    OtlpTraceExporter::instance().confirmDelivered();
+                } else {
+                    std::lock_guard<std::mutex> statsLock(m_statsMutex);
+                    m_stats.tracePostFailures++;
+                }
             }
         }
 
@@ -456,10 +495,18 @@ void OtlpLogExporter::worker() {
          * count that is wrong stays visible rather than appearing once. */
         if (OtlpMetricsExporter::instance().enabled()) {
             const std::string m = OtlpMetricsExporter::instance().takePayload();
-            if (!m.empty() &&
-                !post(OtlpMetricsExporter::instance().endpoint(), m)) {
-                std::lock_guard<std::mutex> statsLock(m_statsMutex);
-                m_stats.metricPostFailures++;
+            if (!m.empty()) {
+                /* Same shape as the span path above: takePayload() only
+                 * renders, commitPayload() moves the counter baselines and
+                 * gauge peaks forward, and that only happens on a
+                 * successful POST. Skipping it on failure means the same
+                 * deltas render again next pass instead of vanishing. */
+                if (post(OtlpMetricsExporter::instance().endpoint(), m)) {
+                    OtlpMetricsExporter::instance().commitPayload();
+                } else {
+                    std::lock_guard<std::mutex> statsLock(m_statsMutex);
+                    m_stats.metricPostFailures++;
+                }
             }
         }
 

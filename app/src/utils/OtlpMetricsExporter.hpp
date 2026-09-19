@@ -76,8 +76,19 @@ class OtlpMetricsExporter {
     /** Convenience for the common case of counting one occurrence. */
     void increment(const char* name) { add(name, 1); }
 
-    /** Renders everything currently held, or "" when there is nothing. */
+    /**
+     * Renders everything currently held, or "" when there is nothing.
+     *
+     * Does not commit: a counter's exported baseline and a gauge's peak stay
+     * where they were until commitPayload() confirms this exact payload was
+     * delivered. Call commitPayload() only after a successful POST; on a
+     * failed one, do nothing and the same deltas render again next time
+     * instead of being silently discarded.
+     */
     [[nodiscard]] std::string takePayload();
+
+    /** Commits the deltas rendered by the most recent takePayload() call. */
+    void commitPayload();
 
   private:
     OtlpMetricsExporter() = default;

@@ -42,6 +42,17 @@ struct Series {
     int64_t peak;
     bool is_counter;
     bool used;
+    /* Set by takePayload() for every series it renders, cleared by
+     * commitPayload(). Marks that `pending_exported`/`pending_peak` below
+     * hold values waiting to become the real baseline once the POST that
+     * carried them is confirmed to have succeeded. */
+    bool pending_commit = false;
+    /* Counter: the value snapshotted at takePayload() time, i.e. what
+     * `exported` becomes once commitPayload() runs. */
+    int64_t pending_exported = 0;
+    /* Gauge: the peak-reset target snapshotted at takePayload() time, i.e.
+     * what `peak` becomes once commitPayload() runs. */
+    int64_t pending_peak = 0;
 };
 
 std::mutex g_mutex;
@@ -97,8 +108,13 @@ void appendEscaped(std::string& out, const char* v) {
 bool g_started = false;
 /* Start of the interval the next export will describe. For delta sums this
  * moves forward on every flush, because each export covers only the window
- * since the last one rather than all of time. */
+ * since the last one rather than all of time. Advanced only by
+ * commitPayload(), not by takePayload(): see the comment there. */
 uint64_t g_intervalStartUnixNano = 0;
+/* End of the interval takePayload() most recently rendered -- what
+ * g_intervalStartUnixNano becomes once commitPayload() confirms that
+ * payload was delivered. */
+uint64_t g_pendingIntervalEndUnixNano = 0;
 
 }  // namespace
 
@@ -261,22 +277,53 @@ std::string OtlpMetricsExporter::takePayload() {
 
     out += "]}]}]}";
 
-    /* Everything in this payload is now accounted for. Counters restart their
-     * delta from here; gauges are untouched, since a gauge reports its current
-     * value every interval and is not consumed by being read. */
+    /*
+     * Recorded, not committed. This used to advance `exported` and `peak`
+     * right here, before the caller had even tried to POST the string just
+     * built -- so a single rejected POST (a 502, same as any other) spent
+     * the delta anyway, and the next takePayload() computed against the new
+     * baseline as if this one had shipped. The counter increments in it were
+     * gone for good, with nothing in any log to say so.
+     *
+     * The fix is to only ever move the baseline in commitPayload(), which
+     * the caller must call after confirming the POST for this exact payload
+     * succeeded. Until then the pending values sit here and a retried
+     * takePayload() (there was no confirm, so nothing has changed) renders
+     * the identical deltas again rather than silently dropping them.
+     */
     for (size_t i = 0; i < kMaxSeries; i++) {
-        if (g_series[i].used && g_series[i].is_counter) {
-            g_series[i].exported = g_series[i].value;
+        if (!g_series[i].used) {
+            continue;
         }
-        /* The peak describes one interval, so it restarts from wherever the
-         * value actually is rather than from zero. Resetting to zero would
+        if (g_series[i].is_counter) {
+            g_series[i].pending_exported = g_series[i].value;
+        }
+        /* The peak describes one interval, so its reset target is wherever
+         * the value actually is rather than zero. Resetting to zero would
          * report a peak below the current value for anything still held open
          * across a flush, which is the normal state of a live count. */
-        g_series[i].peak = g_series[i].value;
+        g_series[i].pending_peak = g_series[i].value;
+        g_series[i].pending_commit = true;
     }
-    g_intervalStartUnixNano = now;
+    g_pendingIntervalEndUnixNano = now;
 
     return out;
+}
+
+void OtlpMetricsExporter::commitPayload() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (size_t i = 0; i < kMaxSeries; i++) {
+        Series& s = g_series[i];
+        if (!s.used || !s.pending_commit) {
+            continue;
+        }
+        if (s.is_counter) {
+            s.exported = s.pending_exported;
+        }
+        s.peak = s.pending_peak;
+        s.pending_commit = false;
+    }
+    g_intervalStartUnixNano = g_pendingIntervalEndUnixNano;
 }
 
 std::string otlp_metrics_snapshot() {

@@ -174,7 +174,11 @@ class OtlpLogExporter {
     std::thread m_thread;
     brls::Event<brls::Logger::TimePoint, brls::LogLevel,
                 std::string>::Subscription m_subscription;
-    bool m_subscribed = false;
+    // Atomic because the subscribed callback reads it from whatever thread
+    // is inside brls::Logger::log() at the time (any thread may log), while
+    // stop() writes it from the teardown path. Guards the callback body only
+    // -- see stop() for why the subscription itself is never removed.
+    std::atomic<bool> m_subscribed { false };
 
     mutable std::mutex m_statsMutex;
     Stats m_stats {};
